@@ -6356,7 +6356,7 @@ const struct FrequencyData kFrequencyDataLibrary[] = {
 
 struct InstData {
     char num[4 + 1]                                 = "----";
-    char fileName[kFileNameSize + 10]               = "";  // Data/InstName.ins
+    char fileName[kFileNameSize + 17]               = "";  // System/Data/InstName.ins (12 + name + 4 + NUL)
     char folderName[kFileNameSize + 10]             = "";
     char nameLong[kFileNameSize + 1]                = "";
     char nameShortL[12 + 1]                         = "------------";

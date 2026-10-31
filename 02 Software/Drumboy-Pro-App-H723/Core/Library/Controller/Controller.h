@@ -474,6 +474,8 @@ class Controller {
     FRESULT sd_createDirectory(const char* path);
     FRESULT sd_deleteDirectory(const char* path);
     void sd_debug(const char* msg, FRESULT res);
+    FRESULT sd_write(const void* buffer, UINT size);  // f_write on sd.file; short write is an error
+    FRESULT sd_read(void* buffer, UINT size);         // f_read on sd.file; short read is an error
 
     static inline int compareWords(const void* str1, const void* str2) { return strcmp(*(char**)str1, *(char**)str2); }
     static inline void sortWords(char* words[], int count) { qsort(words, count, sizeof(words[0]), compareWords); }
