@@ -461,7 +461,10 @@ void Controller::update() {
             layerInstCopyActionFlag = false;
             layerInst_copy();
         }
-        if ((layerInstPasteActionFlag) && (layerInstCopy.copyActive != -1)) {
+        // copyActive is a bool, so the old "!= -1" test was always true; layerInst_paste()
+        // checks copyActive itself. The flag must be consumed here either way, otherwise a
+        // paste pressed with an empty clipboard would fire on the next copy.
+        if (layerInstPasteActionFlag) {
             layerInstPasteActionFlag = false;
             layerInst_paste();
         }
@@ -476,7 +479,8 @@ void Controller::update() {
             layerSongCopyActionFlag = false;
             layerSong_copy();
         }
-        if ((layerSongPasteActionFlag) && (layerSongCopy.copyActive != -1)) {
+        // See layerInstPasteActionFlag above; layerSong_paste() checks copyActive itself.
+        if (layerSongPasteActionFlag) {
             layerSongPasteActionFlag = false;
             layerSong_paste();
         }
@@ -8701,6 +8705,9 @@ void Controller::lcd_drawGlobalMenuData(uint8_t encoderNum_) {
         RGB16Color color = (enc.function == ENC_FNC_OFF) ? kEncoderGlobalInactiveColor : kGlobalMenuDataColor;
         lcd_setMenuDataState(color);
         const char* textPtr;
+        // Formatted values must outlive the switch: textPtr is drawn after it, so a buffer
+        // declared inside a case would already be out of scope (dangling pointer).
+        char valueText[kMenuDataTextSize + 1];
 
         // 3. VALUE TEXT RESOLUTION
         // Resolve value text from encoder function and module state.
@@ -8746,9 +8753,8 @@ void Controller::lcd_drawGlobalMenuData(uint8_t encoderNum_) {
                 // Rhythm functions
 
             case ENC_RHYTHM_TEMPO:
-                char textData[kMenuDataTextSize + 1];
-                sprintf(textData, "       %03d", rhythm.tempo);
-                textPtr = textData;
+                snprintf(valueText, sizeof(valueText), "       %03d", rhythm.tempo);
+                textPtr = valueText;
                 break;
 
             case ENC_RHYTHM_MEASURE:
@@ -8805,9 +8811,8 @@ void Controller::lcd_drawGlobalMenuData(uint8_t encoderNum_) {
 
             case ENC_IO_MIDIIN: {
                 if (keyboard.shiftKeyPress) {
-                    char midiInChanText[kMenuDataTextSize + 1];
-                    sprintf(midiInChanText, "      CH%02d", io.midiInChannel + 1);
-                    textPtr = midiInChanText;
+                    snprintf(valueText, sizeof(valueText), "      CH%02d", io.midiInChannel + 1);
+                    textPtr = valueText;
                 } else {
                     textPtr = kIoMidiModeDataLibrary[io.midiIn].nameLongR;
                 }
@@ -8816,9 +8821,8 @@ void Controller::lcd_drawGlobalMenuData(uint8_t encoderNum_) {
 
             case ENC_IO_MIDIOUT: {
                 if (keyboard.shiftKeyPress) {
-                    char midiOutChanText[kMenuDataTextSize + 1];
-                    sprintf(midiOutChanText, "      CH%02d", io.midiOutChannel + 1);
-                    textPtr = midiOutChanText;
+                    snprintf(valueText, sizeof(valueText), "      CH%02d", io.midiOutChannel + 1);
+                    textPtr = valueText;
                 } else {
                     textPtr = kIoMidiModeDataLibrary[io.midiOut].nameLongR;
                 }
