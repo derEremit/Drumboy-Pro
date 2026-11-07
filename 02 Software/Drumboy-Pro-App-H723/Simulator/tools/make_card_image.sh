@@ -43,6 +43,9 @@ if [ "$(uname -s)" != "Darwin" ]; then
         case "$(basename "$entry")" in ._*|.fseventsd|.Spotlight-V100|.Trashes|.DS_Store) continue ;; esac
         mcopy -i "$IMAGE" -s -Q "$entry" ::/
     done
+    # The firmware refuses to start without System/Firmware (the bootloader's
+    # package archive). Git keeps no empty folders, so the repo's card lacks it.
+    mdir -i "$IMAGE" ::/System/Firmware >/dev/null 2>&1 || mmd -i "$IMAGE" ::/System/Firmware
     echo "Created $IMAGE from $SOURCE"
     exit 0
 fi
@@ -64,6 +67,7 @@ touch "$MOUNT/.metadata_never_index"
 cp -RX "$SOURCE"/ "$MOUNT"/
 find "$MOUNT" -path "$MOUNT/.Spotlight-V100" -prune -o -name '._*' -print0 | xargs -0 rm -f
 rm -rf "$MOUNT/.fseventsd" "$MOUNT/.Spotlight-V100" "$MOUNT/.Trashes" "$MOUNT/.metadata_never_index" 2>/dev/null || true
+mkdir -p "$MOUNT/System/Firmware"                               # Required at boot; git keeps no empty folders
 
 diskutil unmount "$MOUNT" >/dev/null
 echo "Created $IMAGE from $SOURCE"
