@@ -1,10 +1,10 @@
 # Simulator
 
-The simulator runs the real application firmware on a Mac, with no device needed. You can play it in a window that shows the front panel, or run it headless from a script or a control socket to test changes before flashing. The firmware sources compile unchanged; only the hardware layer is replaced.
+The simulator runs the real application firmware on a Mac or a Linux PC, with no device needed. You can play it in a window that shows the front panel, or run it headless from a script or a control socket to test changes before flashing. The firmware sources compile unchanged; only the hardware layer is replaced.
 
 ![Simulator window](images/simulator_panel.png)
 
-- **Window:** the official panel drawing with the live LCD, LEDs and sound. Every key has a keyboard shortcut (printed in its corner), knobs turn by dragging or scrolling, and **Cmd-R** power-cycles.
+- **Window:** the official panel drawing with the live LCD, LEDs and sound. Every key has a keyboard shortcut (printed in its corner), knobs turn by dragging or scrolling, and **Cmd-R** (Ctrl-R on Linux) power-cycles.
 - **Headless:** scripts press keys, turn knobs, take screenshots, record audio and check the firmware's state. `Simulator/tests/*.sim` are the functional tests.
 - **Firmware problems:** it reports `sprintf` overflows, crashes and (optionally) stack overruns that would go unnoticed on the device.
 
@@ -12,7 +12,7 @@ Full reference (commands, options, internals): [Simulator/README.md](../02%20Sof
 
 ## Quick start
 
-Requirements: macOS, Xcode command-line tools, CMake and Ninja. Install them with `brew install cmake ninja`, or let the scripts use the copies the STM32 VS Code extension bundles. The first build downloads SDL3.
+Requirements on macOS: Xcode command-line tools, CMake and Ninja. Install them with `brew install cmake ninja`, or let the scripts use the copies the STM32 VS Code extension bundles. The first build downloads SDL3. On Linux (x86_64): clang, CMake, Ninja, SDL3, poppler-glib, cairo, dosfstools and mtools from the distribution; use the preset `SimulatorLinux` in the commands below and `~/.local/share/DrumboySim` for the card images.
 
 ```sh
 cd "02 Software/Drumboy-Pro-App-H723"

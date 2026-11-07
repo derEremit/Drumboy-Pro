@@ -1,6 +1,6 @@
 # Drumboy Pro simulator
 
-Runs the real firmware on macOS so changes can be checked without flashing: as a visual panel you play with keyboard and mouse, or headless, driven by a script or a socket (by you or an AI assistant). Each run boots the firmware, then presses keys, turns encoders, takes screenshots, records audio and checks state. Jira epic DRUMB-29; MIDI comes later.
+Runs the real firmware on macOS or Linux (x86_64) so changes can be checked without flashing: as a visual panel you play with keyboard and mouse, or headless, driven by a script or a socket (by you or an AI assistant). Each run boots the firmware, then presses keys, turns encoders, takes screenshots, records audio and checks state. Jira epic DRUMB-29; MIDI comes later.
 
 ## Build
 
@@ -14,13 +14,21 @@ cmake --build --preset Simulator          # -> build/Simulator/Simulator/Drumboy
 Simulator/tools/make_card_image.sh <SD card folder> ~/Library/Application\ Support/DrumboySim/drumboy.img
 ```
 
+On Linux the preset is `SimulatorLinux` (clang, system SDL3, poppler-glib and cairo for the panel drawing, `dosfstools` and `mtools` for card images; on Arch: `sdl3 poppler-glib cairo dosfstools mtools clang cmake ninja`). The executable is linked without PIE so that the MCU addresses can be mapped below 4 GB. Card images default to `$XDG_DATA_HOME/DrumboySim` (`~/.local/share/DrumboySim`), the shortcuts use Ctrl instead of Cmd and Alt instead of Option. `DRUMBOY_SIM_OPT=-O0` configures an unoptimised build for debugging.
+
+```sh
+cmake --preset SimulatorLinux
+cmake --build --preset SimulatorLinux     # -> build/SimulatorLinux/Simulator/DrumboySim
+Simulator/tools/make_card_image.sh <SD card folder> ~/.local/share/DrumboySim/drumboy.img
+```
+
 ## Card images
 
 The images live outside the repo, so every checkout and worktree shares them. Defaults and overrides (`Simulator/tools/sim_env.sh`):
 
 | Variable | Default | Used for |
 |---|---|---|
-| `DRUMBOY_SIM_DATA` | `~/Library/Application Support/DrumboySim` | Folder for the two images below |
+| `DRUMBOY_SIM_DATA` | `~/Library/Application Support/DrumboySim` (macOS), `$XDG_DATA_HOME/DrumboySim` (Linux) | Folder for the two images below |
 | `DRUMBOY_SIM_CARD` | `$DRUMBOY_SIM_DATA/drumboy.img` | Card you play with (`run_sim.sh`; `DrumboySim` uses it when `--card` is not given) |
 | `DRUMBOY_SIM_TEST_CARD` | `$DRUMBOY_SIM_DATA/test.img` | Card the tests run on (`run_tests.sh`) |
 | `DRUMBOY_SD_BACKUP` | none | Folder with SD card contents, copied onto the test card when it does not exist yet |
@@ -121,10 +129,10 @@ The application (`Core/Library`, `Core/Plugin`, `main.cpp`), the CubeMX init fil
 | SD card (`sd_diskio.c`) | FatFs on a raw card image (`src/sim_diskio.cpp`) |
 | `main()` | compiled as `firmware_main()` and run on its own thread (`src/sim_main.cpp`) |
 
-`hal/sim_prelude.h` is force-included into every source. It neutralises the MCU `section` attributes, gives FatFs a 32-bit `DWORD`, restores `__weak` and routes `sprintf` through the checked wrapper.
+`hal/sim_prelude.h` is force-included into every source. It neutralises the MCU `section` attributes, gives FatFs a 32-bit `DWORD`, restores `__weak` and routes `sprintf` through the checked wrapper (`hal/sim_sprintf.h`; `hal/cstdio` puts the macro back after libstdc++'s `<cstdio>` undefines it, which otherwise let the firmware's overflowing `sprintf` calls reach libc on Linux).
 
 `Lcd.cpp` is compiled from a generated copy (`cmake/lcd_source.cmake`). Its pixel loops cache `volatile uint32_t* reg = &(port->BSRR)`, which would bypass the GPIO proxies, so the copy declares them `auto`.
 
-**Why x86_64:** the firmware keeps MCU addresses in `uint32_t` (SDRAM `0xC0000000`, icons at `0x38000000`, `DWT_CYCCNT`). The simulator therefore maps memory at those exact addresses, below 4 GB. arm64 macOS reserves the whole low 4 GB, while an x86_64 binary linked with a small `__PAGEZERO` may use it. On Apple silicon it runs under Rosetta.
+**Why x86_64:** the firmware keeps MCU addresses in `uint32_t` (SDRAM `0xC0000000`, icons at `0x38000000`, `DWT_CYCCNT`). The simulator therefore maps memory at those exact addresses, below 4 GB. arm64 macOS reserves the whole low 4 GB, while an x86_64 binary linked with a small `__PAGEZERO` may use it. On Apple silicon it runs under Rosetta. On Linux the executable is linked with `-no-pie` and the regions are mapped with `MAP_FIXED_NOREPLACE`; an AddressSanitizer build (`-fsanitize=address` in the C/C++ flags) maps the SDRAM and core regions over ASan's shadow gap, which works for instrumented code but not for libc interceptors such as `memset` or `fread` into SDRAM.
 
 The firmware builds don't change: simulator code lives only in `Simulator/` and behind the `DRUMBOY_SIMULATOR` CMake option.

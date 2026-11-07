@@ -6,16 +6,28 @@
 // the simulator over the control socket.
 
 #include <execinfo.h>
-#include <mach-o/dyld.h>
 #include <signal.h>
-#include <sys/clonefile.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <sys/clonefile.h>
+#else
+#include <fcntl.h>
+#include <link.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <ucontext.h>
+#include <linux/fs.h>
+#endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "Controller.h"
 #include "sim.h"
@@ -41,20 +53,96 @@ void restart() {
     fflush(stdout);
     if (!options.controlSocket.empty()) unlink(options.controlSocket.c_str());
     char path[4096];
+#ifdef __APPLE__
     uint32_t size = sizeof(path);
     if (_NSGetExecutablePath(path, &size) == 0) execv(path, savedArgv);
+#else
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n > 0) {
+        path[n] = '\0';
+        execv(path, savedArgv);
+    }
+#endif
     perror("sim: restart failed");
     _Exit(1);
 }
 
+// Copy of the card image for --card-copy: a clone on file systems that can
+// (APFS, btrfs, XFS), else a plain copy. Returns false with errno set.
+static bool cloneFile(const char* source, const char* target) {
+#ifdef __APPLE__
+    return clonefile(source, target, 0) == 0;
+#else
+    int in = open(source, O_RDONLY | O_CLOEXEC);
+    if (in < 0) return false;
+    int out = open(target, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (out < 0) {
+        close(in);
+        return false;
+    }
+    bool ok = ioctl(out, FICLONE, in) == 0;                     // Reflink: instant, no extra space (btrfs, XFS)
+    if (!ok) {
+        // Plain copy that keeps the holes of a sparse image: walk the data extents
+        struct stat st {};
+        ok = fstat(in, &st) == 0 && ftruncate(out, st.st_size) == 0;
+        off_t pos = 0;
+        while (ok && pos < st.st_size) {
+            off_t data = lseek(in, pos, SEEK_DATA);
+            if (data < 0) break;                                // No more data: the rest is a hole
+            off_t hole = lseek(in, data, SEEK_HOLE);
+            if (hole < 0) hole = st.st_size;
+            while (ok && data < hole) {
+                size_t chunk = static_cast<size_t>(std::min<off_t>(hole - data, 1 << 20));
+                ssize_t n = copy_file_range(in, &data, out, &data, chunk, 0);
+                if (n < 0 && (errno == EXDEV || errno == ENOSYS || errno == EINVAL)) {
+                    // Different file systems (e.g. image on disk, TMPDIR on tmpfs): plain read/write
+                    static thread_local std::vector<char> buffer(1 << 20);
+                    if (pread(in, buffer.data(), chunk, data) != static_cast<ssize_t>(chunk) ||
+                        pwrite(out, buffer.data(), chunk, data) != static_cast<ssize_t>(chunk)) {
+                        ok = false;
+                        break;
+                    }
+                    data += static_cast<off_t>(chunk);
+                } else if (n <= 0) {
+                    ok = false;
+                }
+            }
+            pos = hole;
+        }
+    }
+    int savedErrno = errno;
+    close(in);
+    close(out);
+    if (!ok) unlink(target);
+    errno = savedErrno;
+    return ok;
+#endif
+}
+
 }  // namespace sim
 
+#ifndef __APPLE__
+static int firstLoadAddress(struct dl_phdr_info* info, size_t, void* out) {
+    *static_cast<uintptr_t*>(out) = info->dlpi_addr;             // The main program comes first; 0 for a non-PIE build
+    return 1;
+}
+#endif
+
 // Firmware crashes print the faulting address and a backtrace, so a failed
-// test run shows where (symbolize with: atos -o DrumboySim -l LOAD_ADDRESS PC)
+// test run shows where (symbolize with: atos -o DrumboySim -l LOAD_ADDRESS PC
+// on macOS, addr2line -e DrumboySim PC on Linux)
 static void crashHandler(int sig, siginfo_t* info, void* context) {
     auto* uc = static_cast<ucontext_t*>(context);
-    fprintf(stderr, "sim: crashed with signal %d at pc 0x%llx (address %p), load address %p\n", sig,
-            static_cast<unsigned long long>(uc->uc_mcontext->__ss.__rip), info->si_addr, static_cast<const void*>(_dyld_get_image_header(0)));
+#ifdef __APPLE__
+    unsigned long long pc = uc->uc_mcontext->__ss.__rip;
+    const void* load = _dyld_get_image_header(0);
+#else
+    unsigned long long pc = static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RIP]);
+    uintptr_t loadAddress = 0;
+    dl_iterate_phdr(firstLoadAddress, &loadAddress);
+    const void* load = reinterpret_cast<const void*>(loadAddress);
+#endif
+    fprintf(stderr, "sim: crashed with signal %d at pc 0x%llx (address %p), load address %p\n", sig, pc, info->si_addr, load);
     void* frames[64];
     int count = backtrace(frames, 64);
     backtrace_symbols_fd(frames, count, 2);
@@ -129,10 +217,18 @@ int main(int argc, char** argv) {
         if (reuse) {
             snprintf(cardClonePath, sizeof(cardClonePath), "%s", reuse);
         } else {
+#ifdef __APPLE__
             const char* tmp = getenv("TMPDIR");
-            snprintf(cardClonePath, sizeof(cardClonePath), "%s/drumboy-card-%d.img", tmp ? tmp : "/tmp", getpid());
+            std::string cloneDir = tmp ? tmp : "/tmp";
+#else
+            // Next to the image: same file system, so FICLONE can reflink it (TMPDIR overrides)
+            const char* tmp = getenv("TMPDIR");
+            std::string cloneDir = tmp ? tmp : sim::options.cardImage.substr(0, sim::options.cardImage.find_last_of('/') == std::string::npos ? 0 : sim::options.cardImage.find_last_of('/'));
+            if (cloneDir.empty()) cloneDir = ".";
+#endif
+            snprintf(cardClonePath, sizeof(cardClonePath), "%s/drumboy-card-%d.img", cloneDir.c_str(), getpid());
             unlink(cardClonePath);
-            if (clonefile(sim::options.cardImage.c_str(), cardClonePath, 0) != 0) {
+            if (!sim::cloneFile(sim::options.cardImage.c_str(), cardClonePath)) {
                 perror("sim: cannot clone the card image");
                 return 1;
             }

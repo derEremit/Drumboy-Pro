@@ -18,8 +18,8 @@ CARD="$(cd "$(dirname "$CARD")" && pwd)/$(basename "$CARD")"
 
 sim_find_build_tools
 cd "$FW_DIR"
-[ -d build/Simulator ] || cmake --preset Simulator >/dev/null
-cmake --build --preset Simulator | grep -E 'error|FAILED' || true
+[ -d "build/$SIM_PRESET" ] || cmake --preset "$SIM_PRESET" >/dev/null
+cmake --build --preset "$SIM_PRESET" | grep -E 'error|FAILED' || true
 
 cd "$BUILD_DIR"
 exec Simulator/DrumboySim --card "$CARD" --control sim.sock "$@"

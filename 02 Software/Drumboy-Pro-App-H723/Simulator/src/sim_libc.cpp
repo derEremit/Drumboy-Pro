@@ -48,7 +48,13 @@ extern "C" int sim_sprintf(char* buffer, size_t size, const char* file, int line
         return n;
     }
 
-    memcpy(buffer, text, size);                                 // What fits, as on the device
+    // Keep what fits and terminate inside the buffer: a byte shorter than the
+    // device shows, but the string stays a string for the strcat/strlen that
+    // follow. The device writes the NUL past the end instead.
+    if (size > 0) {
+        memcpy(buffer, text, size - 1);
+        buffer[size - 1] = '\0';
+    }
     const char* name = strrchr(file, '/');
     std::string site = std::string(name ? name + 1 : file) + ":" + std::to_string(line);
     sim::warn(site, "firmware sprintf overflow at " + site + ": writes " + std::to_string(needed) + " bytes into a " +

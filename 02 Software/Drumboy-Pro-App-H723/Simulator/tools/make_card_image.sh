@@ -6,6 +6,8 @@
 #
 # The image is sparse, so it only takes the space of the copied files.
 # macOS metadata (._ files, .fseventsd, Spotlight) is kept off the card.
+# On Linux the image is a FAT32 volume without a partition table (FatFs mounts
+# both), made with mkfs.vfat and filled with mtools, so no root is needed.
 
 set -euo pipefail
 
@@ -27,6 +29,24 @@ if [ -e "$IMAGE" ]; then
 fi
 
 mkdir -p "$(dirname "$IMAGE")"
+
+if [ "$(uname -s)" != "Darwin" ]; then
+    for tool in mkfs.vfat mcopy; do
+        command -v "$tool" >/dev/null || { echo "$tool not found (install dosfstools and mtools)" >&2; exit 1; }
+    done
+    truncate -s "${SIZE^^}" "$IMAGE"                              # Sparse; mkfs.vfat wants the size in upper case units
+    mkfs.vfat -F 32 -n DRUMBOY "$IMAGE" >/dev/null
+    # mtools copies directories recursively; skip macOS metadata files
+    export MTOOLS_SKIP_CHECK=1
+    for entry in "$SOURCE"/* "$SOURCE"/.[!.]*; do
+        [ -e "$entry" ] || continue
+        case "$(basename "$entry")" in ._*|.fseventsd|.Spotlight-V100|.Trashes|.DS_Store) continue ;; esac
+        mcopy -i "$IMAGE" -s -Q "$entry" ::/
+    done
+    echo "Created $IMAGE from $SOURCE"
+    exit 0
+fi
+
 mkfile -n "$SIZE" "$IMAGE"
 DISK=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$IMAGE" | head -1 | awk '{print $1}')
 cleanup() { hdiutil detach "$DISK" -quiet || true; }

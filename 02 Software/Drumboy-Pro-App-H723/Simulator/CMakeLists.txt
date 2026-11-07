@@ -1,4 +1,5 @@
-# Drumboy Pro simulator: the firmware compiled for macOS (preset "Simulator").
+# Drumboy Pro simulator: the firmware compiled for the host (presets "Simulator"
+# on macOS, "SimulatorLinux" on Linux).
 #
 # The application (Core/Library, Core/Plugin, main.cpp), the CubeMX init files
 # (Core/Src) and FatFs compile unchanged against the real ST headers. Replaced:
@@ -7,16 +8,22 @@
 #   - SD card driver (src/sim_diskio.cpp): FatFs on a card image
 #   - Lcd.cpp: compiled from a generated copy (cmake/lcd_source.cmake)
 #
-# Built for x86_64 and run with Rosetta on Apple silicon: the firmware keeps
-# MCU addresses (SDRAM 0xC0000000, RAM_D3 0x38000000, registers) in uint32_t,
-# so they are mapped at the same addresses, below 4 GB. arm64 macOS reserves
-# the whole low 4 GB (__PAGEZERO); x86_64 allows a small one.
+# Built for x86_64: the firmware keeps MCU addresses (SDRAM 0xC0000000, RAM_D3
+# 0x38000000, registers) in uint32_t, so they are mapped at the same addresses,
+# below 4 GB. On macOS that needs a small __PAGEZERO (arm64 reserves the whole
+# low 4 GB, so Apple silicon runs the x86_64 build under Rosetta). On Linux it
+# needs a non-PIE executable, so the program itself stays below 4 GB too.
 
-if(NOT APPLE)
-    message(FATAL_ERROR "The simulator currently builds on macOS only")
-endif()
-if(NOT CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
-    message(FATAL_ERROR "The simulator must be built with CMAKE_OSX_ARCHITECTURES=x86_64 (use the Simulator preset)")
+if(APPLE)
+    if(NOT CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+        message(FATAL_ERROR "The simulator must be built with CMAKE_OSX_ARCHITECTURES=x86_64 (use the Simulator preset)")
+    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        message(FATAL_ERROR "The simulator needs an x86_64 Linux host (MCU addresses must fit below 4 GB)")
+    endif()
+else()
+    message(FATAL_ERROR "The simulator builds on macOS and Linux only")
 endif()
 
 set(FW_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
@@ -53,19 +60,33 @@ list(APPEND SIM_FIRMWARE_SOURCES
     ${FW_DIR}/FATFS/App/fatfs.c
 )
 
-# SDL3 for the panel window and sound, built from the release source as a static x86_64 library
-include(FetchContent)
-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-set(SDL_STATIC ON CACHE BOOL "" FORCE)
-set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(SDL_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(SDL3
-    URL https://github.com/libsdl-org/SDL/releases/download/release-3.2.10/SDL3-3.2.10.tar.gz
-    URL_HASH SHA256=f87be7b4dec66db4098e9c167b2aa34e2ca10aeb5443bdde95ae03185ed513e0
-    DOWNLOAD_EXTRACT_TIMESTAMP ON
-)
-FetchContent_MakeAvailable(SDL3)
+# SDL3 for the panel window and sound. The distribution's SDL3 when it has one
+# (Linux), else built from the release source as a static x86_64 library.
+find_package(SDL3 CONFIG QUIET)
+if(SDL3_FOUND)
+    set(SIM_SDL_TARGET SDL3::SDL3)
+    message(STATUS "Simulator: system SDL3 ${SDL3_VERSION}")
+else()
+    include(FetchContent)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(SDL3
+        URL https://github.com/libsdl-org/SDL/releases/download/release-3.2.10/SDL3-3.2.10.tar.gz
+        URL_HASH SHA256=f87be7b4dec66db4098e9c167b2aa34e2ca10aeb5443bdde95ae03185ed513e0
+        DOWNLOAD_EXTRACT_TIMESTAMP ON
+    )
+    FetchContent_MakeAvailable(SDL3)
+    set(SIM_SDL_TARGET SDL3::SDL3-static)
+endif()
+
+# Panel drawing (a PDF): CoreGraphics on macOS, poppler + cairo on Linux
+if(NOT APPLE)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SIM_PDF REQUIRED IMPORTED_TARGET poppler-glib cairo)
+endif()
 
 # Official panel drawing (MIT), rendered at run time
 get_filename_component(PANEL_ART "${FW_DIR}/../../01 Hardware/Drawing/Drumboy Pro Graphic.ai" ABSOLUTE)
@@ -115,9 +136,10 @@ target_compile_definitions(DrumboySim PRIVATE
     DRUMBOY_BUILD_NUMBER=${FW_BUILD_NUMBER}
 )
 
+set(DRUMBOY_SIM_OPT "-O2" CACHE STRING "Optimisation level of the simulator build (-O0 for debugging)")
 target_compile_options(DrumboySim PRIVATE
     -include ${CMAKE_CURRENT_SOURCE_DIR}/hal/sim_prelude.h
-    -O2 -g -ffast-math
+    ${DRUMBOY_SIM_OPT} -g -ffast-math
     -fno-strict-aliasing                        # register/buffer type punning as on the MCU
     -fshort-enums                               # as arm-none-eabi: enums are 1 byte (KEYSTATE arrays, file formats)
     -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable
@@ -134,8 +156,13 @@ endif()
 set_source_files_properties(${SIM_FIRMWARE_SOURCES} PROPERTIES COMPILE_OPTIONS "${SIM_FIRMWARE_FLAGS}")
 set_source_files_properties(${FW_DIR}/Core/Src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=firmware_main")
 
-target_link_options(DrumboySim PRIVATE -Wl,-pagezero_size,0x1000)
-target_link_libraries(DrumboySim PRIVATE z SDL3::SDL3-static "-framework CoreGraphics" "-framework CoreFoundation")
+if(APPLE)
+    target_link_options(DrumboySim PRIVATE -Wl,-pagezero_size,0x1000)
+    target_link_libraries(DrumboySim PRIVATE z ${SIM_SDL_TARGET} "-framework CoreGraphics" "-framework CoreFoundation")
+else()
+    target_link_options(DrumboySim PRIVATE -no-pie)
+    target_link_libraries(DrumboySim PRIVATE z ${SIM_SDL_TARGET} PkgConfig::SIM_PDF)
+endif()
 # sim_window.cpp only uses host libraries: no firmware prelude
 set_source_files_properties(src/sim_window.cpp PROPERTIES
     COMPILE_DEFINITIONS "SIM_NO_PRELUDE;DRUMBOY_PANEL_ART=\"${PANEL_ART}\""

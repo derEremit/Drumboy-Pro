@@ -12,19 +12,27 @@
             "name": "Debug",
             "displayName": "Debug (-Ofast, release build: plugin host + CYBERYAK label)",
             "inherits": "base",
-            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug"
+            }
         },
         {
             "name": "Stock",
             "displayName": "Stock (Debug without any additions, identical to official firmware)",
             "inherits": "base",
-            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "DRUMBOY_PLUGINS": "OFF", "DRUMBOY_BRANDING": "OFF" }
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "DRUMBOY_PLUGINS": "OFF",
+                "DRUMBOY_BRANDING": "OFF"
+            }
         },
         {
             "name": "Release",
             "displayName": "Release (-Os, smaller, slower DSP)",
             "inherits": "base",
-            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release"
+            }
         },
         {
             "name": "Simulator",
@@ -38,13 +46,52 @@
                 "CMAKE_OSX_ARCHITECTURES": "x86_64",
                 "CMAKE_C_COMPILER": "clang",
                 "CMAKE_CXX_COMPILER": "clang++"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "SimulatorLinux",
+            "displayName": "Simulator (Linux desktop build, x86_64, system SDL3 + poppler)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "toolchainFile": "${sourceDir}/Simulator/cmake/host.cmake",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            },
+            "cacheVariables": {
+                "DRUMBOY_SIMULATOR": "ON",
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++"
             }
         }
     ],
     "buildPresets": [
-        { "name": "Debug", "configurePreset": "Debug" },
-        { "name": "Stock", "configurePreset": "Stock" },
-        { "name": "Release", "configurePreset": "Release" },
-        { "name": "Simulator", "configurePreset": "Simulator" }
+        {
+            "name": "Debug",
+            "configurePreset": "Debug"
+        },
+        {
+            "name": "Stock",
+            "configurePreset": "Stock"
+        },
+        {
+            "name": "Release",
+            "configurePreset": "Release"
+        },
+        {
+            "name": "Simulator",
+            "configurePreset": "Simulator"
+        },
+        {
+            "name": "SimulatorLinux",
+            "configurePreset": "SimulatorLinux"
+        }
     ]
 }

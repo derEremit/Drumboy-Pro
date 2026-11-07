@@ -31,20 +31,10 @@ typedef int LONG;
 typedef unsigned int DWORD;
 typedef unsigned long long QWORD;
 
-// sprintf into fixed buffers: the firmware has off-by-one overflows (a format
-// one byte longer than the buffer, e.g. "       %03d" into char[10]). On the
-// device the extra NUL lands in a neighbouring stack slot and goes unnoticed;
-// on x86_64 it can hit a saved register. sim_sprintf keeps the bytes that fit
-// (the same buffer contents as on the device), drops the rest and reports the
-// call site once. Buffers of unknown size are written normally.
-#include <stddef.h>
-#include <stdio.h>
-#ifdef __cplusplus
-extern "C"
-#endif
-int sim_sprintf(char* buffer, size_t size, const char* file, int line, const char* format, ...) __attribute__((format(printf, 5, 6)));
-#undef sprintf
-#define sprintf(buffer, ...) sim_sprintf((buffer), __builtin_object_size((buffer), 1), __FILE__, __LINE__, __VA_ARGS__)
+// sprintf into fixed buffers is routed to sim_sprintf (hal/sim_sprintf.h).
+// libstdc++'s <cstdio> undefines the macro, so hal/cstdio re-applies it after
+// the real header (hal/ is first on the include path).
+#include "sim_sprintf.h"
 
 #endif
 #endif

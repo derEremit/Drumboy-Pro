@@ -1,6 +1,7 @@
 # Shared paths for the simulator scripts (sourced by run_sim.sh and run_tests.sh).
 #
 #   DRUMBOY_SIM_DATA        card images folder, default ~/Library/Application Support/DrumboySim
+#                           on macOS, $XDG_DATA_HOME/DrumboySim (~/.local/share/DrumboySim) on Linux
 #   DRUMBOY_SIM_CARD        playing card, default $DRUMBOY_SIM_DATA/drumboy.img
 #   DRUMBOY_SIM_TEST_CARD   test card, default $DRUMBOY_SIM_DATA/test.img
 #   DRUMBOY_SD_BACKUP       folder with SD card contents, used to create the test card
@@ -9,9 +10,13 @@
 
 SIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FW_DIR="$(dirname "$SIM_DIR")"
-BUILD_DIR="$FW_DIR/build/Simulator"
+case "$(uname -s)" in
+    Darwin) SIM_PRESET="Simulator"; SIM_DATA_DEFAULT="$HOME/Library/Application Support/DrumboySim" ;;
+    *)      SIM_PRESET="SimulatorLinux"; SIM_DATA_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/DrumboySim" ;;
+esac
+BUILD_DIR="$FW_DIR/build/$SIM_PRESET"
 
-SIM_DATA="${DRUMBOY_SIM_DATA:-$HOME/Library/Application Support/DrumboySim}"
+SIM_DATA="${DRUMBOY_SIM_DATA:-$SIM_DATA_DEFAULT}"
 SIM_CARD="${DRUMBOY_SIM_CARD:-$SIM_DATA/drumboy.img}"
 SIM_TEST_CARD="${DRUMBOY_SIM_TEST_CARD:-$SIM_DATA/test.img}"
 

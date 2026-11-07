@@ -1,17 +1,23 @@
 // Visual front panel (SDL3).
 //
 // The official panel drawing (01 Hardware/Drawing/Drumboy Pro Graphic.ai, a
-// PDF) is rendered with CoreGraphics at the window's pixel size; the LCD,
-// pressed keys, pad and EQ LEDs and knob positions are drawn over it from the
-// simulated hardware every frame, so presses from scripts and simctl show up
-// as well. Keys respond to the Mac keyboard (shortcut printed in each key's
-// corner) and the mouse; knobs turn by dragging, scrolling, or holding Option
-// over a knob and moving the pointer. Audio plays through the default output.
+// PDF) is rendered at the window's pixel size, with CoreGraphics on macOS and
+// poppler/cairo on Linux; the LCD, pressed keys, pad and EQ LEDs and knob
+// positions are drawn over it from the simulated hardware every frame, so
+// presses from scripts and simctl show up as well. Keys respond to the
+// keyboard (shortcut printed in each key's corner) and the mouse; knobs turn
+// by dragging, scrolling, or holding Option (Alt on Linux) over a knob and
+// moving the pointer. Audio plays through the default output.
 //
 // Layout coordinates are PDF points (page 841.9 x 595.3, origin top-left),
 // measured from the drawing.
 
+#ifdef __APPLE__
 #include <CoreGraphics/CoreGraphics.h>
+#else
+#include <cairo.h>
+#include <poppler.h>
+#endif
 #include <SDL3/SDL.h>
 
 #include <algorithm>
@@ -105,6 +111,15 @@ static const float kKnobRadius = 22.5f;
 
 static const Rect kScreen = {266.0f, 172.0f, 310.5f, 173.5f};   // Inside the screen outline
 
+// Window shortcuts use the platform's command key: Cmd on macOS, Ctrl elsewhere
+#ifdef __APPLE__
+static const SDL_Keymod kCommandMod = SDL_KMOD_GUI;
+static const char* kHelpLine = "Keys: shortcut in each key's corner, or click.  Knobs: drag, scroll, or hold Option and move.  Cmd-R: power cycle.";
+#else
+static const SDL_Keymod kCommandMod = SDL_KMOD_CTRL;
+static const char* kHelpLine = "Keys: shortcut in each key's corner, or click.  Knobs: drag, scroll, or hold Alt and move.  Ctrl-R: power cycle.";
+#endif
+
 // EQ meters: 12 LEDs per side, bit 0 at the bottom
 static const float kEqX[] = {51.0f, 790.9f};
 static const float kEqTop = 229.3f, kEqStep = 5.255f;
@@ -142,7 +157,8 @@ static int knobAt(float ux, float uy) {
 
 /* Panel art ----------------------------------------------------- */
 
-// Renders the crop rectangle of the drawing at `scale` pixels per point (RGBA)
+// Renders the crop rectangle of the drawing at `scale` pixels per point
+#ifdef __APPLE__
 static SDL_Texture* renderArt(SDL_Renderer* renderer, float scale) {
     const char* path = DRUMBOY_PANEL_ART;
     CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, reinterpret_cast<const UInt8*>(path), strlen(path), false);
@@ -174,6 +190,47 @@ static SDL_Texture* renderArt(SDL_Renderer* renderer, float scale) {
     SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
     return texture;
 }
+#else
+static SDL_Texture* renderArt(SDL_Renderer* renderer, float scale) {
+    const char* path = DRUMBOY_PANEL_ART;
+    GError* error = nullptr;
+    gchar* uri = g_filename_to_uri(path, nullptr, nullptr);
+    PopplerDocument* doc = uri ? poppler_document_new_from_file(uri, nullptr, &error) : nullptr;
+    g_free(uri);
+    if (!doc) {
+        fprintf(stderr, "sim: cannot open panel drawing %s%s%s\n", path, error ? ": " : "", error ? error->message : "");
+        if (error) g_error_free(error);
+        return nullptr;
+    }
+    PopplerPage* page = poppler_document_get_page(doc, 0);
+    if (!page) {
+        fprintf(stderr, "sim: panel drawing %s has no page\n", path);
+        g_object_unref(doc);
+        return nullptr;
+    }
+
+    // Cairo and poppler use the same top-left origin and point units as kCrop
+    int w = static_cast<int>(kCrop.w * scale), h = static_cast<int>(kCrop.h * scale);
+    cairo_surface_t* surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    cairo_t* cr = cairo_create(surface);
+    cairo_set_source_rgb(cr, 0.09, 0.09, 0.10);                 // Window background around the panel
+    cairo_paint(cr);
+    cairo_scale(cr, scale, scale);
+    cairo_translate(cr, -kCrop.x, -kCrop.y);
+    poppler_page_render(page, cr);
+    cairo_destroy(cr);
+    cairo_surface_flush(surface);
+    g_object_unref(page);
+    g_object_unref(doc);
+
+    // CAIRO_FORMAT_ARGB32 is native-endian 0xAARRGGBB, which is SDL's ARGB8888
+    SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
+    SDL_UpdateTexture(texture, nullptr, cairo_image_surface_get_data(surface), cairo_image_surface_get_stride(surface));
+    SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+    cairo_surface_destroy(surface);
+    return texture;
+}
+#endif
 
 /* Audio --------------------------------------------------------- */
 
@@ -338,9 +395,7 @@ static void drawPanel(SDL_Renderer* r, SDL_Texture* art, SDL_Texture* lcd, int a
         text(r, cx + (kKnobRadius - 2) * kUnits, cy + (kKnobRadius - 6) * kUnits, label, {150, 150, 150, 255});
     }
 
-    text(r, 12, 10,
-         "Keys: shortcut in each key's corner, or click.  Knobs: drag, scroll, or hold Option and move.  Cmd-R: power cycle.",
-         {170, 170, 170, 255});
+    text(r, 12, 10, kHelpLine, {170, 170, 170, 255});
 }
 
 /* Main loop ----------------------------------------------------- */
@@ -407,14 +462,14 @@ int windowRun() {
                 case SDL_EVENT_KEY_UP: {
                     bool down = e.type == SDL_EVENT_KEY_DOWN;
                     if (e.key.repeat) break;
-                    if ((e.key.mod & SDL_KMOD_GUI) && e.key.scancode == SDL_SCANCODE_Q) {
+                    if ((e.key.mod & kCommandMod) && e.key.scancode == SDL_SCANCODE_Q) {
                         running = false;
                         break;
                     }
-                    if ((e.key.mod & SDL_KMOD_GUI) && e.key.scancode == SDL_SCANCODE_R && down) {
+                    if ((e.key.mod & kCommandMod) && e.key.scancode == SDL_SCANCODE_R && down) {
                         restart();                              // Power cycle (e.g. after switching plugins); exec releases SDL
                     }
-                    if (e.key.mod & SDL_KMOD_GUI) break;         // Other Cmd shortcuts are not panel keys
+                    if (e.key.mod & kCommandMod) break;          // Other command shortcuts are not panel keys
                     if (e.key.scancode == SDL_SCANCODE_LALT || e.key.scancode == SDL_SCANCODE_RALT) {
                         if (down && dragKnob < 0) {
                             float mx, my, ux, uy;

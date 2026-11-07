@@ -33,7 +33,7 @@ TESTS=("$@")
 [ ${#TESTS[@]} -eq 0 ] && TESTS=("$SIM_DIR"/tests/*.sim)
 
 if [ ! -x "$BIN" ]; then
-    echo "error: simulator not built ($BIN). Build it: cmake --preset Simulator && cmake --build --preset Simulator" >&2
+    echo "error: simulator not built ($BIN). Build it: cmake --preset $SIM_PRESET && cmake --build --preset $SIM_PRESET" >&2
     exit 100
 fi
 
