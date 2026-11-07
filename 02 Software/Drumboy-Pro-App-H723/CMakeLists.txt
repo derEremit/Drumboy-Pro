@@ -4,8 +4,9 @@
 #   cmake -G Ninja -S . -B build -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake
 #   ninja -C build
 #
-# build/ is gitignored. The result is a raw application image for 0x08020000. It is not an SD package: that needs the 36-byte header the
-# bootloader checks (title, version, size, CRC).
+# build/ is gitignored. Outputs: the raw application image for 0x08020000 and,
+# through ../Firmware/make_sd_package.py, the SD-card package with the 36-byte
+# header the bootloader checks (title, version, size, CRC).
 cmake_minimum_required(VERSION 3.22)
 if(NOT CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/arm-none-eabi.cmake")
@@ -50,6 +51,15 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,-Map=${PROJECT_NAME}.map -Wl,--gc-sections -Wl,--print-memory-usage -static)
 target_link_libraries(${PROJECT_NAME} PRIVATE -Wl,--start-group c m stdc++ supc++ -Wl,--end-group)
 
+# Raw image, size report, and the SD-card package (Drumboy_Pro_Fw_MM_mm.bin,
+# version from kVersionMajor/kVersionMinor in Global.h) for the factory bootloader.
+find_package(Python3 COMPONENTS Interpreter)
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${PROJECT_NAME}> ${PROJECT_NAME}.bin
     COMMAND ${CMAKE_SIZE} $<TARGET_FILE:${PROJECT_NAME}>)
+if(Python3_Interpreter_FOUND)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/../Firmware/make_sd_package.py"
+                pack ${PROJECT_NAME}.bin -o .
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+endif()
