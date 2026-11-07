@@ -20983,19 +20983,25 @@ void Controller::layerSong_resetAllBeats(uint8_t layerNum_, uint8_t bankTab_) {
     Layer& layer = layerLibrary[layerNum_];
     Bank& bank = layer.bankLibrary[bankTab_];
 
-    // 1. ACTIVE BANK VALIDATION
-    // Continue only when target bank contains active beats.
-    if (bank.lastActiveBeatNum != -1) {
-        // 2. FULL BANK RESET
-        // Clear all beat slots and reset runtime beat pointers.
-        for (uint16_t i = 0; i < kBeatLibrarySize; i++) {
-            bank.resetBeat(i);
-        }
+    const bool hadBeats = (bank.lastActiveBeatNum != -1);
+
+    // 1. FULL BANK RESET
+    // Clear every beat. resetBeat frees a slot its beat still owns. A slot
+    // orphaned by an older clear has no owner, so drop the whole table too.
+    // That also runs when the beat list is already empty (New File after Clear).
+    for (uint16_t i = 0; i < kBeatLibrarySize; i++) {
+        bank.resetBeat(i);
+    }
+    for (uint8_t fill = 0; fill < kBeatFillLibrarySize; fill++) {
+        bank.beatFillLibrary[fill].reset();
+    }
+
+    if (hadBeats) {
         bank.lastActiveBeatNum = -1;
         bank.playBeatNum = -1;
         lcd_clearSong(layerNum_, bankTab_);
 
-        // 3. CONDITIONAL UI REFRESH
+        // 2. CONDITIONAL UI REFRESH
         // Refresh beat widgets when target bank is currently visible.
         if ((selectedLayerNum == layerNum_) && (activeSongBank == bankTab_) && (menu = LAYER_SONG_MENU)) {
             selectedBeatNum = -1;

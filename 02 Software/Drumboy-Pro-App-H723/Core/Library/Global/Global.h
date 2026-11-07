@@ -7035,17 +7035,17 @@ struct Bank {
         Beat& beat = beatLibrary[beatNum_];
         uint8_t oldTarget = beat.getFillTarget();
 
-        beat.setActive(false);
-        beat.setStartInterval(0);
-        beat.setEndInterval(0);
-        beat.setFillType(0);
-
+        // ownerOfFillTarget only matches an active beat. Free the slot first.
         if (oldTarget != NULL_FILL_TARGET) {
             if (ownerOfFillTarget(oldTarget) == beatNum_) {
                 beatFillLibrary[oldTarget].reset();
             }
         }
 
+        beat.setActive(false);
+        beat.setStartInterval(0);
+        beat.setEndInterval(0);
+        beat.setFillType(0);
         beat.setFillTarget(NULL_FILL_TARGET);
         beat.setFillTime(0);
         beat.setFillLevel(0);
