@@ -14,6 +14,7 @@ This branch starts at Randomwaves commit `858322d`, the factory V1.01 source, an
 | `9ff7444` | Upstream PR #3 by grafster: SD DMA reads into buffers that are not word aligned landed 2 bytes early (SDMMC IDMA ignores the low address bits), corrupting WAVs whose data chunk is not at a multiple of 4. Enables the FatFs scratch-buffer path for unaligned buffers, waits for the card between scratch sectors, aligns the sample load buffer. | Builds; grafster tested it on their unit |
 | `9e71acd` | `Firmware/make_sd_package.py` builds and checks SD packages (same format as `Drumboy-Pro-Firmware-Builder.cpp`); CMake post-build writes `Drumboy_Pro_Fw_01_11.bin`. | Repacks the factory payload byte for byte |
 | `385e9ec` | This file. | n/a |
+| `5f76f21` | Five sprintf buffers one byte too short for their terminator (`fileNum[3]` with `%03d`, `numSample[4]` with `%04d`, the precount `kCountDownData[2]` with `%02d`, `kData[10]` with a 10-character format), and an unassigned encoder no longer reads one past `kEncoderFuncDataLibrary`. Found with cyberyak's simulator on Linux: the precount NUL cleared a saved `this` there and REC from idle stopped working. | Builds; all four simulator tests pass with the fixes |
 
 ## Build
 
