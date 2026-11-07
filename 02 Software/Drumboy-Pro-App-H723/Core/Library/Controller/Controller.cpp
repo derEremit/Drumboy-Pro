@@ -3206,12 +3206,15 @@ void Controller::encoder_update() {
 
         // 2. COUNTER STATE RESET
         // Refresh resolution and clear per-encoder step accumulators.
+        // ENC_FNC_NONE (0x61) is one past the table, so an unassigned encoder
+        // must not read kEncoderFuncDataLibrary at all.
         uint8_t functionIndex = static_cast<uint8_t>(enc.function);
         if (functionIndex >= encoderFuncCount) {
             enc.function = ENC_FNC_NONE;
-            functionIndex = static_cast<uint8_t>(ENC_FNC_NONE);
+            enc.resolution = ENC_RES_M;
+        } else {
+            enc.resolution = kEncoderFuncDataLibrary[functionIndex].resolution;
         }
-        enc.resolution = kEncoderFuncDataLibrary[functionIndex].resolution;
         enc.incCounter = 0;
         enc.decCounter = 0;
 
@@ -5104,7 +5107,7 @@ SdResult Controller::sd_getFileLibrary() {
     // Iterate through all possible file slots defined by the kFileLibrarySize constant.
     for (uint8_t i = 0; i < kFileLibrarySize; i++) {
         char fileName[50];
-        char fileNum[3];
+        char fileNum[4];                                        // "%03d" plus NUL
 
         // 3. FILENAME CONSTRUCTION
         // Generate a formatted 3-digit number (e.g., 001, 002) to create the full path.
@@ -5160,7 +5163,7 @@ SdResult Controller::sd_getDrumkitLibrary() {
     // Iterate through all possible drumkit slots defined by kDrumkitLibrarySize.
     for (uint8_t i = 0; i < kDrumkitLibrarySize; i++) {
         char fileName[50];
-        char fileNum[3];
+        char fileNum[4];                                        // "%03d" plus NUL
 
         // 3. FILENAME GENERATION
         // Format the current index into a 3-digit string (e.g., Drumkit_001.rwd).
@@ -7862,7 +7865,7 @@ void Controller::lcd_drawSdData() {
     // 6. SAMPLE COUNT APPEND
     // Append sample count (or compact K format) or placeholder.
     if (sd.ready) {
-        char numSample[4];
+        char numSample[5];                                      // "%04d" plus NUL
         if (totalSampleLibrarySize < 10000) {
             sprintf(numSample, "%04d", totalSampleLibrarySize);
             strcat(sdText, numSample);
@@ -9928,7 +9931,7 @@ void Controller::lcd_drawRhythm_TempoData() {
 
     // 2. TEMPO DRAW
     // Format and draw current tempo value.
-    char kData[kMenuDataTextSize];
+    char kData[kMenuDataTextSize + 1];                          // 10 characters plus NUL
     sprintf(kData, "       %03d", rhythm.tempo);
     lcd.drawText(kData, kMenuDataTextSize, kMenuDataX[0], kMenuDataY[0]);
 
@@ -12430,7 +12433,7 @@ void Controller::lcd_drawCountDown() {
 
             // 3. DRAW & DECREMENT
             // Draw current countdown value then decrement by one.
-            char kCountDownData[2];
+            char kCountDownData[3];                             // "%02d" plus NUL
             sprintf(kCountDownData, "%02d", metronome.countDown);
             lcd.drawText(kCountDownData, 2, 163, 112);
             metronome.countDown -= 1;
