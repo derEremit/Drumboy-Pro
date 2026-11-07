@@ -26,7 +26,12 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
-
+/* Snapshot of an I2C event that no transfer owned. See I2C_ServiceOrphanedEvent. */
+typedef struct {
+  uint32_t count; /* orphaned events seen since reset */
+  uint32_t isr;   /* I2C ISR at the last one */
+  uint32_t cr1;   /* I2C CR1 at the last one */
+} I2C_OrphanRecord;
 /* USER CODE END TD */
 
 /* Private define ------------------------------------------------------------*/
@@ -41,7 +46,39 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
+volatile I2C_OrphanRecord i2c3_orphan = {0, 0, 0};
+volatile I2C_OrphanRecord i2c4_orphan = {0, 0, 0};
 
+/* Randomwaves/Drumboy-Pro#1. The UI froze with I2C3 ISR = 0x21 (STOPF pending),
+   CR1 = 0x21 (STOPIE set) and hi2c3.XferISR == NULL. HAL_I2C_EV_IRQHandler only
+   dispatches through XferISR, so with no owner it returns without clearing the
+   flag and the interrupt re-enters until everything at priority 2 and the main
+   loop are starved. Audio at priority 0 keeps running. Writing STOPCF to ICR
+   ended the freeze on the reporter's unit. Do the same here, for every event
+   bit that is enabled with no owner, and disable those enables. The next HAL
+   transfer enables what it needs again. */
+static void I2C_ServiceOrphanedEvent(I2C_HandleTypeDef *hi2c, volatile I2C_OrphanRecord *rec)
+{
+  const uint32_t enables = I2C_CR1_ERRIE | I2C_CR1_TCIE | I2C_CR1_STOPIE | I2C_CR1_NACKIE |
+                           I2C_CR1_ADDRIE | I2C_CR1_RXIE | I2C_CR1_TXIE;
+  if (hi2c->XferISR != NULL)
+  {
+    return;
+  }
+  uint32_t cr1 = hi2c->Instance->CR1;
+  if ((cr1 & enables) == 0U)
+  {
+    return;
+  }
+  rec->count++;
+  rec->isr = hi2c->Instance->ISR;
+  rec->cr1 = cr1;
+  /* RXNE and TXIS have no clear bit; dropping RXIE/TXIE below is what stops them. */
+  hi2c->Instance->ICR = I2C_ICR_ADDRCF | I2C_ICR_NACKCF | I2C_ICR_STOPCF | I2C_ICR_BERRCF |
+                        I2C_ICR_ARLOCF | I2C_ICR_OVRCF | I2C_ICR_PECCF | I2C_ICR_TIMOUTCF |
+                        I2C_ICR_ALERTCF;
+  hi2c->Instance->CR1 = cr1 & ~enables;
+}
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -581,7 +618,7 @@ void I2C3_EV_IRQHandler(void)
   /* USER CODE END I2C3_EV_IRQn 0 */
   HAL_I2C_EV_IRQHandler(&hi2c3);
   /* USER CODE BEGIN I2C3_EV_IRQn 1 */
-
+  I2C_ServiceOrphanedEvent(&hi2c3, &i2c3_orphan);
   /* USER CODE END I2C3_EV_IRQn 1 */
 }
 
@@ -609,7 +646,7 @@ void I2C4_EV_IRQHandler(void)
   /* USER CODE END I2C4_EV_IRQn 0 */
   HAL_I2C_EV_IRQHandler(&hi2c4);
   /* USER CODE BEGIN I2C4_EV_IRQn 1 */
-
+  I2C_ServiceOrphanedEvent(&hi2c4, &i2c4_orphan);
   /* USER CODE END I2C4_EV_IRQn 1 */
 }
 
