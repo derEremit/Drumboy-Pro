@@ -2873,20 +2873,25 @@ void Controller::keyboard_downLong() {
 }
 
 void Controller::keyboard_resetI2C() {
-    /// @brief Resets I2C3 peripheral hardware to recover from keyboard bus lockups.
-    /// Used when MCP23017 transactions fail and the bus state machine stalls.
+    /// @brief Recovers I2C3 after a failed keypad transaction.
+    /// Used when an MCP23017 transfer cannot start and the bus state machine stalls.
+    /// A bare RCC reset is not enough: it leaves PE and TIMINGR at zero while the
+    /// HAL handle still reports READY, and the next blocking codec write in Dac.cpp
+    /// (HAL_MAX_DELAY) would then wait forever with the screen frozen.
 
-    // 1. FORCE RESET ASSERT
-    // Clear internal peripheral state via RCC reset line.
+    // 1. HAL TEARDOWN
+    // Stop the DMA streams and interrupts, release the GPIOs, reset handle state and lock.
+    HAL_I2C_DeInit(&hi2c3);
+
+    // 2. PERIPHERAL RESET
+    // Clear the I2C state machine through RCC, also when a slave still holds SDA.
     __HAL_RCC_I2C3_FORCE_RESET();
-
-    // 2. STABILIZATION DELAY
-    // Short wait to guarantee reset propagation.
     HAL_Delay(1);
-
-    // 3. RESET RELEASE
-    // Return peripheral to operational state for subsequent HAL transactions.
     __HAL_RCC_I2C3_RELEASE_RESET();
+
+    // 3. HAL RE-INIT
+    // Same configuration as at boot: timing, filters, DMA streams, NVIC.
+    MX_I2C3_Init();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
