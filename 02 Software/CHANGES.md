@@ -11,11 +11,13 @@ This branch starts at Randomwaves commit `858322d`, the factory V1.01 source, an
 | `bf07c1d` | `CMakeLists.txt` and `cmake/arm-none-eabi.cmake` in `Drumboy-Pro-App-H723/`, CubeIDE Debug flags. | Builds with Arm GNU 14.3.rel1 |
 | `2f4c43f` | Randomwaves/Drumboy-Pro#1. After `HAL_I2C_EV_IRQHandler`, an I2C3 or I2C4 event with no owning transfer (`XferISR == NULL`) is cleared and its enables dropped instead of re-entering forever. `i2c3_orphan` / `i2c4_orphan` count the events for an SWD read. | Compiles; not yet triggered on the unit |
 | `ca5c2b6` | `keyboard_resetI2C` did a bare RCC reset, leaving I2C3 disabled while the HAL handle said READY; the next blocking codec write would hang the main loop. Now `HAL_I2C_DeInit`, reset pulse, `MX_I2C3_Init`. | Compiles |
+| `9ff7444` | Upstream PR #3 by grafster: SD DMA reads into buffers that are not word aligned landed 2 bytes early (SDMMC IDMA ignores the low address bits), corrupting WAVs whose data chunk is not at a multiple of 4. Enables the FatFs scratch-buffer path for unaligned buffers, waits for the card between scratch sectors, aligns the sample load buffer. | Builds; grafster tested it on their unit |
 | `9e71acd` | `Firmware/make_sd_package.py` builds and checks SD packages (same format as `Drumboy-Pro-Firmware-Builder.cpp`); CMake post-build writes `Drumboy_Pro_Fw_01_11.bin`. | Repacks the factory payload byte for byte |
+| `385e9ec` | This file. | n/a |
 
 ## Build
 
-Arm GNU Toolchain 14.3.rel1, CMake, Ninja:
+Arm GNU Toolchain 14.3.rel1, CMake, Ninja. The toolchain file looks in `$ARM_GNU_HOME/bin`, then a `tools/arm-gnu-toolchain-*-arm-none-eabi/` directory up to four levels above the project, then `/tmp/arm-gnu-14.3`, then `PATH`:
 
 ```
 cd "02 Software/Drumboy-Pro-App-H723"
