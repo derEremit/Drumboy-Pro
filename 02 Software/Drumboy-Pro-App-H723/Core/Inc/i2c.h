@@ -44,6 +44,8 @@ void MX_I2C3_Init(void);
 void MX_I2C4_Init(void);
 
 /* USER CODE BEGIN Prototypes */
+void I2C3_BusRecover(void);
+extern volatile uint32_t i2c3RecoverCount; /* bumped by every I2C3_BusRecover() */
 
 /* USER CODE END Prototypes */
 

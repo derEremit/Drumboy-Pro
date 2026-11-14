@@ -344,5 +344,80 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
 
 /* USER CODE BEGIN 1 */
 
+/* Short busy wait for the bit-banged bus recovery (a few microseconds at 550 MHz; the exact
+ * timing does not matter, slower is fine). A plain loop, so it needs no timer and also works
+ * inside interrupts. */
+static void I2C3_RecoveryDelay(void)
+{
+  for (volatile uint32_t i = 0; i < 2000; i++) {
+  }
+}
+
+/* Frees a stuck I2C3 bus and brings the peripheral back to a clean, working state.
+ * I2C3 carries the three keypad MCP23017s and the SGTL5000 codec.
+ *
+ * The old recovery only pulsed the RCC reset line. That leaves I2C3 disabled with TIMINGR = 0
+ * while the HAL handle still says READY, so every later transfer hung or failed: pads, buttons
+ * and every codec write were dead until power-off (v2.09 fix).
+ *
+ * Steps: de-init (GPIO, DMA, IRQ), clock up to 9 SCL pulses as plain GPIO until a slave that
+ * holds SDA low lets go, send a STOP, reset the peripheral through RCC, then run the normal init
+ * again. Never calls Error_Handler, so a failed recovery cannot freeze the device. */
+volatile uint32_t i2c3RecoverCount = 0;
+
+void I2C3_BusRecover(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  i2c3RecoverCount++;
+  HAL_I2C_DeInit(&hi2c3);
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+
+  /* SCL (PA8) and SDA (PC9) as open-drain outputs, released (high). */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_SET);
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = GPIO_PIN_9;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+  I2C3_RecoveryDelay();
+
+  /* Up to 9 clocks: a slave stuck in the middle of a byte finishes it and releases SDA. */
+  for (uint8_t i = 0; i < 9; i++) {
+    if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_9) == GPIO_PIN_SET) break;
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
+    I2C3_RecoveryDelay();
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
+    I2C3_RecoveryDelay();
+  }
+
+  /* STOP condition: SDA goes low -> high while SCL is high. */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
+  I2C3_RecoveryDelay();
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_RESET);
+  I2C3_RecoveryDelay();
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
+  I2C3_RecoveryDelay();
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_9, GPIO_PIN_SET);
+  I2C3_RecoveryDelay();
+
+  /* Clean peripheral registers, then the normal init (MspInit restores AF pins, DMA, IRQs). */
+  __HAL_RCC_I2C3_CLK_ENABLE();
+  __HAL_RCC_I2C3_FORCE_RESET();
+  I2C3_RecoveryDelay();
+  __HAL_RCC_I2C3_RELEASE_RESET();
+
+  hi2c3.State = HAL_I2C_STATE_RESET;
+  if (HAL_I2C_Init(&hi2c3) == HAL_OK) {
+    HAL_I2CEx_ConfigAnalogFilter(&hi2c3, I2C_ANALOGFILTER_ENABLE);
+    HAL_I2CEx_ConfigDigitalFilter(&hi2c3, 0);
+  }
+}
+
 /* USER CODE END 1 */
 

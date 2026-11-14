@@ -18,8 +18,11 @@ class Dac {
    private:
     /* Codec Register Access Helpers ----------------------------- */
 
+    bool i2cTransmit(uint8_t* data_, uint16_t len_);
+    bool i2cReceive(uint8_t* data_, uint16_t len_);
+    bool readRegister(uint16_t reg_, uint16_t& out_);
     uint16_t readRegisterFull(uint16_t reg_);
-    void writeRegisterFull(uint16_t reg_, uint16_t data_);
+    bool writeRegisterFull(uint16_t reg_, uint16_t data_);
     uint16_t readRegisterMask(uint16_t reg_, uint16_t mask_, uint16_t shift_);
     void writeRegisterMask(uint16_t reg_, uint16_t mask, uint16_t shift_, uint16_t input_);
     HAL_StatusTypeDef i2cWaitReady(uint32_t timeout_);

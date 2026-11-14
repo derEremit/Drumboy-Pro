@@ -15,101 +15,85 @@ Dac::~Dac() {}
 /* Private Functions ---------------------------------------------------------*/
 ////////////////////////////////////////////////////////////////////////////////
 
-uint16_t Dac::readRegisterFull(uint16_t reg) {
-    /// @brief Reads a full 16-bit SGTL5000 register over I2C.
+// v2.09 freeze fix: every codec transfer used HAL_MAX_DELAY ("wait forever"), so a stuck or
+// switched-off I2C3 bus hung the main loop for good on the next volume / mute / line-in change.
+// Transfers now give up after kI2cTimeoutMs and a timed-out bus is recovered; a failed read is
+// reported, so read-modify-write never writes a random value into a codec register and the
+// volume ramps no longer start from garbage.
+static const uint32_t kI2cTimeoutMs = 10;     // one 2-4 byte transfer takes well under 1 ms
+static const uint32_t kI2cReadyWaitMs = 20;   // a keypad DMA read may be finishing
 
-    // 1. REGISTER ADDRESS PREP
-    // Build transmit frame with target register address.
-    uint8_t txData[2];
-    uint8_t rxData[2];
-    txData[0] = (reg >> 8) & 0xFF;
-    txData[1] = reg & 0xFF;
+bool Dac::i2cTransmit(uint8_t* data, uint16_t len) {
+    /// @brief Sends bytes to the codec with a bounded wait; recovers a stuck bus on timeout.
 
-    // 2. I2C TRANSFER
-    // Send register address, then read back two data bytes.
-    if (i2cWaitReady(100) == HAL_OK) {
-        HAL_I2C_Master_Transmit(&hi2c3, SGTL5000_I2C_ADDRESS, txData, 2, HAL_MAX_DELAY);
+    if (i2cWaitReady(kI2cReadyWaitMs) != HAL_OK) {
+        I2C3_BusRecover();
+        return false;
     }
-    if (i2cWaitReady(100) == HAL_OK) {
-        HAL_I2C_Master_Receive(&hi2c3, SGTL5000_I2C_ADDRESS, rxData, 2, HAL_MAX_DELAY);
-    }
-
-    // 3. DATA ASSEMBLY
-    // Merge MSB/LSB to a single 16-bit value.
-    return (rxData[0] << 8) | rxData[1];
+    const HAL_StatusTypeDef status = HAL_I2C_Master_Transmit(&hi2c3, SGTL5000_I2C_ADDRESS, data, len, kI2cTimeoutMs);
+    if ((status == HAL_TIMEOUT) || (status == HAL_BUSY)) I2C3_BusRecover();
+    return status == HAL_OK;
 }
 
-void Dac::writeRegisterFull(uint16_t reg, uint16_t data) {
+bool Dac::i2cReceive(uint8_t* data, uint16_t len) {
+    /// @brief Reads bytes from the codec with a bounded wait; recovers a stuck bus on timeout.
+
+    if (i2cWaitReady(kI2cReadyWaitMs) != HAL_OK) {
+        I2C3_BusRecover();
+        return false;
+    }
+    const HAL_StatusTypeDef status = HAL_I2C_Master_Receive(&hi2c3, SGTL5000_I2C_ADDRESS, data, len, kI2cTimeoutMs);
+    if ((status == HAL_TIMEOUT) || (status == HAL_BUSY)) I2C3_BusRecover();
+    return status == HAL_OK;
+}
+
+bool Dac::readRegister(uint16_t reg, uint16_t& out) {
+    /// @brief Reads a full 16-bit SGTL5000 register. Returns false (out untouched) on failure.
+
+    uint8_t txData[2] = {(uint8_t)((reg >> 8) & 0xFF), (uint8_t)(reg & 0xFF)};
+    uint8_t rxData[2] = {0, 0};
+    if (!i2cTransmit(txData, 2)) return false;
+    if (!i2cReceive(rxData, 2)) return false;
+    out = (uint16_t)((rxData[0] << 8) | rxData[1]);
+    return true;
+}
+
+uint16_t Dac::readRegisterFull(uint16_t reg) {
+    /// @brief Reads a full 16-bit SGTL5000 register over I2C (0 when the read fails).
+
+    uint16_t data = 0;
+    readRegister(reg, data);
+    return data;
+}
+
+bool Dac::writeRegisterFull(uint16_t reg, uint16_t data) {
     /// @brief Writes a full 16-bit value to an SGTL5000 register.
 
-    // 1. REGISTER FRAME PREP
-    // Build register address + payload write frame.
     uint8_t txData[4];
     txData[0] = (reg >> 8) & 0xFF;
     txData[1] = reg & 0xFF;
     txData[2] = (data >> 8) & 0xFF;
     txData[3] = data & 0xFF;
-
-    // 2. I2C WRITE
-    // Transmit full write frame when bus is ready.
-    if (i2cWaitReady(100) == HAL_OK) {
-        HAL_I2C_Master_Transmit(&hi2c3, SGTL5000_I2C_ADDRESS, txData, 4, HAL_MAX_DELAY);
-    }
+    return i2cTransmit(txData, 4);
 }
 
 uint16_t Dac::readRegisterMask(uint16_t reg, uint16_t mask, uint16_t shift) {
-    /// @brief Reads a masked bitfield from a 16-bit SGTL5000 register.
+    /// @brief Reads a masked bitfield from a 16-bit SGTL5000 register (0 when the read fails).
 
-    // 1. REGISTER ADDRESS PREP
-    // Build transmit frame with target register address.
-    uint8_t txData[2];
-    uint8_t rxData[2];
-    txData[0] = (reg >> 8) & 0xFF;
-    txData[1] = reg & 0xFF;
-
-    // 2. I2C READ SEQUENCE
-    // Request register, then receive 16-bit data.
-    if (i2cWaitReady(100) == HAL_OK) {
-        HAL_I2C_Master_Transmit(&hi2c3, SGTL5000_I2C_ADDRESS, txData, 2, HAL_MAX_DELAY);
-    }
-    if (i2cWaitReady(100) == HAL_OK) {
-        HAL_I2C_Master_Receive(&hi2c3, SGTL5000_I2C_ADDRESS, rxData, 2, HAL_MAX_DELAY);
-    }
-
-    // 3. MASK EXTRACTION
-    // Apply mask and right shift to return field value.
-    uint16_t data = (rxData[0] << 8) | rxData[1];
+    uint16_t data = 0;
+    readRegister(reg, data);
     return (data & mask) >> shift;
 }
 
 void Dac::writeRegisterMask(uint16_t reg, uint16_t mask, uint16_t shift, uint16_t input) {
     /// @brief Updates a masked bitfield in a register using read-modify-write.
+    /// Nothing is written when the read fails: patching an unknown value would put random bits
+    /// into the other fields of the register.
 
-    // 1. CURRENT VALUE READ
-    // Read current register value before patching target field.
-    uint8_t txData[4];
-    uint8_t rxData[2];
-    txData[0] = (reg >> 8) & 0xFF;
-    txData[1] = reg & 0xFF;
-    if (i2cWaitReady(100) == HAL_OK) {
-        HAL_I2C_Master_Transmit(&hi2c3, SGTL5000_I2C_ADDRESS, txData, 2, HAL_MAX_DELAY);
-    }
-    if (i2cWaitReady(100) == HAL_OK) {
-        HAL_I2C_Master_Receive(&hi2c3, SGTL5000_I2C_ADDRESS, rxData, 2, HAL_MAX_DELAY);
-    }
-
-    // 2. FIELD PATCH
-    // Clear target mask and write updated input bits.
-    uint16_t data = (rxData[0] << 8) | rxData[1];
+    uint16_t data = 0;
+    if (!readRegister(reg, data)) return;
     data = (data & (~mask)) + (input << shift);
-    txData[2] = (data >> 8) & 0xFF;
-    txData[3] = data & 0xFF;
-
-    // 3. MODIFIED VALUE WRITE
-    // Send patched register value back to codec.
-    if (i2cWaitReady(100) == HAL_OK) {
-        HAL_I2C_Master_Transmit(&hi2c3, SGTL5000_I2C_ADDRESS, txData, 4, HAL_MAX_DELAY);
-    }
+    writeRegisterFull(reg, data);
 }
 
 HAL_StatusTypeDef Dac::i2cWaitReady(uint32_t timeout) {
@@ -495,17 +479,25 @@ void Dac::setHeadphoneVolume(uint8_t volume_) {
 
     // 1. TARGET LOOKUP
     // Map UI volume index to codec register data.
-    uint8_t hpData = kMixerHpVolumeDataLibrary[volume_].data;
-    uint8_t currentHpData = (uint8_t)(readRegisterFull(ANA_HP_CTRL_REG) >> 8);
+    const uint8_t target = kMixerHpVolumeDataLibrary[volume_].data;
+
+    // v2.09: when the current value cannot be read, jump straight to the target instead of
+    // ramping from a random start (that took up to 255 writes on a busy bus).
+    uint16_t reg = 0;
+    if (!readRegister(ANA_HP_CTRL_REG, reg)) {
+        writeRegisterFull(ANA_HP_CTRL_REG, (target << 8) | target);
+        return;
+    }
+    uint8_t current = (uint8_t)(reg >> 8);
 
     // 2. SMOOTH RAMP
-    // Increment/decrement one step at a time to target.
-    if (currentHpData != hpData) {
-        int8_t increment;
-        (currentHpData < hpData) ? increment = 1 : increment = -1;
-        while (currentHpData != hpData) {
-            currentHpData += increment;
-            writeRegisterFull(ANA_HP_CTRL_REG, (currentHpData << 8) | currentHpData);
+    // Increment/decrement one step at a time to target; a failed write ends the ramp with
+    // one direct write of the target.
+    while (current != target) {
+        current = (current < target) ? (uint8_t)(current + 1) : (uint8_t)(current - 1);
+        if (!writeRegisterFull(ANA_HP_CTRL_REG, (current << 8) | current)) {
+            writeRegisterFull(ANA_HP_CTRL_REG, (target << 8) | target);
+            return;
         }
     }
 }
@@ -527,17 +519,25 @@ void Dac::setLineoutVolume(uint8_t volume_) {
 
     // 1. TARGET LOOKUP
     // Map UI volume index to codec register data.
-    uint8_t loData = kMixerLoVolumeDataLibrary[volume_].data;
-    uint8_t currentLoData = (uint8_t)(readRegisterFull(LINE_OUT_VOL_REG) >> 8);
+    const uint8_t target = kMixerLoVolumeDataLibrary[volume_].data;
+
+    // v2.09: when the current value cannot be read, jump straight to the target instead of
+    // ramping from a random start (that took up to 255 writes on a busy bus).
+    uint16_t reg = 0;
+    if (!readRegister(LINE_OUT_VOL_REG, reg)) {
+        writeRegisterFull(LINE_OUT_VOL_REG, (target << 8) | target);
+        return;
+    }
+    uint8_t current = (uint8_t)(reg >> 8);
 
     // 2. SMOOTH RAMP
-    // Increment/decrement one step at a time to target.
-    if (currentLoData != loData) {
-        int8_t increment;
-        (currentLoData < loData) ? increment = 1 : increment = -1;
-        while (currentLoData != loData) {
-            currentLoData += increment;
-            writeRegisterFull(LINE_OUT_VOL_REG, (currentLoData << 8) | currentLoData);
+    // Increment/decrement one step at a time to target; a failed write ends the ramp with
+    // one direct write of the target.
+    while (current != target) {
+        current = (current < target) ? (uint8_t)(current + 1) : (uint8_t)(current - 1);
+        if (!writeRegisterFull(LINE_OUT_VOL_REG, (current << 8) | current)) {
+            writeRegisterFull(LINE_OUT_VOL_REG, (target << 8) | target);
+            return;
         }
     }
 }
