@@ -15,6 +15,7 @@ This branch starts at Randomwaves commit `858322d`, the factory V1.01 source, an
 | `9e71acd` | `Firmware/make_sd_package.py` builds and checks SD packages (same format as `Drumboy-Pro-Firmware-Builder.cpp`); CMake post-build writes `Drumboy_Pro_Fw_01_11.bin`. | Repacks the factory payload byte for byte |
 | `385e9ec` | This file. | n/a |
 | `5f76f21` | Five sprintf buffers one byte too short for their terminator (`fileNum[3]` with `%03d`, `numSample[4]` with `%04d`, the precount `kCountDownData[2]` with `%02d`, `kData[10]` with a 10-character format), and an unassigned encoder no longer reads one past `kEncoderFuncDataLibrary`. Found with cyberyak's simulator on Linux: the precount NUL cleared a saved `this` there and REC from idle stopped working. | Builds; all four simulator tests pass with the fixes |
+| `a1a1e91` | From daupuck's v2.09 freeze fixes (`1ee8076`, branch `fix/freeze-hunt`): `I2C3_BusRecover()` clocks a stuck slave off SDA and re-initialises I2C3 without `Error_Handler`, replacing the `ca5c2b6` sequence; codec transfers wait 10 ms instead of forever and a failed read is no longer written back; the keypad scanner times out a read (20 ms) or a busy bus (50 ms), retries failed transfers and reads a keypad whose INT line stayed low after a missed edge. Their watchdog and crash log are not taken. | Builds; daupuck's branch is their own test, not yet run on our unit |
 
 ## Build
 
