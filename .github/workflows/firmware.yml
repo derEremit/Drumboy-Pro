@@ -1,0 +1,48 @@
+name: Firmware
+
+on:
+  push:
+    paths:
+      - "02 Software/**"
+      - ".github/workflows/firmware.yml"
+  pull_request:
+    paths:
+      - "02 Software/**"
+      - ".github/workflows/firmware.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fill engine tests (host, ASan/UBSan)
+        run: make -C "02 Software/tests"
+
+  build-app:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+
+      - name: Build application (warnings in our code are errors)
+        working-directory: "02 Software/Drumboy-Pro-App-H723"
+        run: make -j"$(nproc)" WERROR=1
+
+      - name: Package (test build, not for release)
+        working-directory: "02 Software/Drumboy-Pro-App-H723"
+        run: make package VERSION=0.00
+
+      - name: Validate committed firmware packages
+        working-directory: "02 Software/Firmware"
+        run: for f in Drumboy_Pro_Fw_*.bin; do python3 ../tools/package_firmware.py --check "$f"; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drumboy-pro-app
+          path: |
+            02 Software/Drumboy-Pro-App-H723/build/app.elf
+            02 Software/Drumboy-Pro-App-H723/build/app.bin
+            02 Software/Drumboy-Pro-App-H723/build/app.map

@@ -1,9 +1,9 @@
 #include "Lcd.h"
 
 Lcd::Lcd(LcdRotation rotation_, RGB16Color foreColor_, RGB16Color backColor_, LcdFont font_)
-    : rotation(rotation_),
-      foreColor(foreColor_),
+    : foreColor(foreColor_),
       backColor(backColor_),
+      rotation(rotation_),
       fontAlignment(LEFT) {
     // set dimensions based on rotation
     switch (rotation) {
@@ -1864,7 +1864,7 @@ void Lcd::drawInitSdAlert(SdResult sdResult) {
 
     // 5. ALERT TEXT SELECTION
     // Select message string based on SD result code.
-    const char* alertText;
+    const char* alertText = "";
     switch (sdResult) {
         case SD_ERROR_DETECT:
             alertText = kSdAlertTextInsert;
@@ -1904,6 +1904,8 @@ void Lcd::drawInitSdAlert(SdResult sdResult) {
             break;
         case SD_ANALYZE:
             alertText = kSdAlertTextAnalyze;
+            break;
+        default:
             break;
     }
 

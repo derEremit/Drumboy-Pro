@@ -172,6 +172,18 @@ SECTIONS
     . = ALIGN(32);
   } >RAM_D2
 
+  /* Stereo audio work memory in the DTCM RAM (zeroed in main). It must stay below the watchdog stage and crash record at 0x2001FFA0. */
+  .dtcm (NOLOAD) :
+  {
+    . = ALIGN(32);
+    __dtcm_start = .;
+    *(.dtcm)
+    *(.dtcm*)
+    . = ALIGN(32);
+    __dtcm_end = .;
+  } >DTCMRAM
+  ASSERT(__dtcm_end <= 0x2001FF00, "DTCM work memory runs into the crash record")
+
   .RAM_D3 (NOLOAD) :
   {
     . = ALIGN(4);

@@ -22,6 +22,8 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "CrashRecord.h"
+#include "Version.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -89,6 +91,46 @@ static void I2C_ServiceOrphanedEvent(I2C_HandleTypeDef *hi2c, volatile I2C_Orpha
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* Crash record (CrashRecord.h): called by the fault handlers with the exception stack frame
+   (r0-r3, r12, lr, pc, psr). Fills the record at the top of the DTCM RAM and resets, so the
+   firmware restarts and reports the crash instead of staying frozen. */
+__attribute__((used, noreturn)) void Crash_Capture(uint32_t* frame, uint32_t kind)
+{
+  CrashRecord* r = (CrashRecord*)CRASH_RECORD_ADDRESS;
+  uint32_t f = (uint32_t)frame;
+  /* The frame must lie in RAM_D1 (a wild stack pointer is not read). */
+  uint32_t ok = (f >= 0x24000000u) && (f <= (0x24050000u - 32u)) && ((f & 3u) == 0u);
+
+  __disable_irq();
+  if (crashValid(r))
+  {
+    /* A crash before the last record was read (during start-up): don't reboot forever. */
+    while (1)
+    {
+    }
+  }
+  r->magic = 0;
+  r->kind = kind;
+  r->lr = ok ? frame[5] : 0;
+  r->pc = ok ? frame[6] : 0;
+  r->psr = ok ? frame[7] : 0;
+  r->sp = f;
+  r->cfsr = SCB->CFSR;
+  r->hfsr = SCB->HFSR;
+  r->bfar = SCB->BFAR;
+  r->mmfar = SCB->MMFAR;
+  r->version = ((uint32_t)FW_VERSION_MAJOR << 8) | (uint32_t)FW_VERSION_MINOR;
+  crashSeal(r);
+  NVIC_SystemReset();
+  while (1)
+  {
+  }
+}
+
+/* Handler body: r0 = the stack frame the exception pushed (main or process stack), r1 = kind. */
+#define CRASH_HANDLER_BODY(kind) \
+  __asm volatile("tst lr, #4\n ite eq\n mrseq r0, msp\n mrsne r0, psp\n movs r1, #" #kind "\n b Crash_Capture\n")
+
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -130,77 +172,46 @@ extern UART_HandleTypeDef huart6;
 /**
   * @brief This function handles Non maskable interrupt.
   */
-void NMI_Handler(void)
+__attribute__((naked)) void NMI_Handler(void)
 {
-  /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
-  /* USER CODE END NonMaskableInt_IRQn 0 */
-  HAL_RCC_NMI_IRQHandler();
-  /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
-   while (1)
-  {
-  }
-  /* USER CODE END NonMaskableInt_IRQn 1 */
+  /* Record where it happened and restart (CrashRecord.h); this handler used to loop forever. */
+  CRASH_HANDLER_BODY(5);
 }
 
 /**
   * @brief This function handles Hard fault interrupt.
   */
-void HardFault_Handler(void)
+__attribute__((naked)) void HardFault_Handler(void)
 {
-  /* USER CODE BEGIN HardFault_IRQn 0 */
-
-  /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
+  /* Record where it happened and restart (CrashRecord.h); this handler used to loop forever. */
+  CRASH_HANDLER_BODY(1);
 }
 
 /**
   * @brief This function handles Memory management fault.
   */
-void MemManage_Handler(void)
+__attribute__((naked)) void MemManage_Handler(void)
 {
-  /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
-  /* USER CODE END MemoryManagement_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
-    /* USER CODE END W1_MemoryManagement_IRQn 0 */
-  }
+  /* Record where it happened and restart (CrashRecord.h); this handler used to loop forever. */
+  CRASH_HANDLER_BODY(2);
 }
 
 /**
   * @brief This function handles Pre-fetch fault, memory access fault.
   */
-void BusFault_Handler(void)
+__attribute__((naked)) void BusFault_Handler(void)
 {
-  /* USER CODE BEGIN BusFault_IRQn 0 */
-
-  /* USER CODE END BusFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_BusFault_IRQn 0 */
-    /* USER CODE END W1_BusFault_IRQn 0 */
-  }
+  /* Record where it happened and restart (CrashRecord.h); this handler used to loop forever. */
+  CRASH_HANDLER_BODY(3);
 }
 
 /**
   * @brief This function handles Undefined instruction or illegal state.
   */
-void UsageFault_Handler(void)
+__attribute__((naked)) void UsageFault_Handler(void)
 {
-  /* USER CODE BEGIN UsageFault_IRQn 0 */
-
-  /* USER CODE END UsageFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_UsageFault_IRQn 0 */
-    /* USER CODE END W1_UsageFault_IRQn 0 */
-  }
+  /* Record where it happened and restart (CrashRecord.h); this handler used to loop forever. */
+  CRASH_HANDLER_BODY(4);
 }
 
 /**

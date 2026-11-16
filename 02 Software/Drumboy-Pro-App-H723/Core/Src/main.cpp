@@ -21,8 +21,9 @@ extern "C" void System_Initialize();
 
 /* Memory Allocation In D1 Ram ----------------------------------- */
 
-uint32_t i2s_rxBuffer[I2S_TOTAL_BUFFER_SIZE] = {0x00};
-uint32_t i2s_txBuffer[I2S_TOTAL_BUFFER_SIZE] = {0x00};
+// 32-byte aligned, a multiple of 32 bytes: the data cache build maintains them around the DMA.
+uint32_t i2s_rxBuffer[I2S_TOTAL_BUFFER_SIZE] __attribute__((aligned(32))) = {0x00};
+uint32_t i2s_txBuffer[I2S_TOTAL_BUFFER_SIZE] __attribute__((aligned(32))) = {0x00};
 
 /* Memory Allocation In D3 Ram ----------------------------------- */
 
@@ -33,11 +34,27 @@ __attribute__((section(".RAM_D3"))) uint8_t i2c4_txData[2] = {0x00};
 
 /* Sync And Midi Buffers ----------------------------------------- */
 
-uint8_t midiRxData;
+MidiRxBox midiRxBox;
 
 /* Global Controller Instance ------------------------------------ */
 
 Controller controller;
+
+#ifdef ENABLE_DCACHE
+// Memory attributes for the data cache build (make DCACHE=1, backlog 53 headroom work).
+//   SDRAM (0xC0000000, 16 MB): normal, write-back and write-allocate. Only the CPU uses it (the
+//   screen is bit-banged, samples reach it through the CPU), so it needs no maintenance.
+//   RAM_D3 (0x38000000, 16 KB): not cacheable: the I2C DMA buffers live there.
+// The DMA buffers in the AXI RAM (I2S, MIDI, SD) are cleaned and invalidated by address instead.
+static void mpu_configureForDataCache() {
+    ARM_MPU_Disable();
+    ARM_MPU_SetRegion(ARM_MPU_RBAR(0, 0xC0000000u), ARM_MPU_RASR(0, ARM_MPU_AP_FULL, 1, 0, 1, 1, 0, ARM_MPU_REGION_SIZE_16MB));
+    ARM_MPU_SetRegion(ARM_MPU_RBAR(1, 0x38000000u), ARM_MPU_RASR(0, ARM_MPU_AP_FULL, 1, 1, 0, 0, 0, ARM_MPU_REGION_SIZE_16KB));
+    ARM_MPU_Enable(MPU_CTRL_PRIVDEFENA_Msk);
+    __DSB();
+    __ISB();
+}
+#endif
 
 int main() {
     // System Startup
@@ -46,7 +63,17 @@ int main() {
     SCB_InvalidateICache();
     SCB_InvalidateDCache();
     SCB_EnableICache();
+#ifdef ENABLE_DCACHE
+    mpu_configureForDataCache();
+    SCB_EnableDCache();
+#endif
     HAL_Init();
+
+    // The stereo work memory in the DTCM RAM is not initialised by the start-up code.
+    {
+        extern uint32_t __dtcm_start, __dtcm_end;
+        for (uint32_t* w = &__dtcm_start; w < &__dtcm_end; w++) *w = 0;
+    }
 
     // Enable FPU (Floating Point Unit)
     SCB->CPACR |= ((3UL << 10 * 2) | (3UL << 11 * 2));
@@ -173,6 +200,18 @@ extern "C" void System_Initialize() {
     MX_TIM17_Init();
     MX_TIM23_Init();
     MX_TIM24_Init();
+
+    // MIDI IN (backlog 30/34): the UART's receive FIFO holds bytes while higher-priority interrupts
+    // (audio, SD) run, and the receive interrupts sit above the sequencer timer so each clock
+    // byte is timestamped and handled promptly.
+    HAL_UARTEx_EnableFifoMode(&huart1);
+    HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 1, 0);
+    HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+
+    // Sequencer (TIM15) and clock (TIM4) timers: a new period takes effect at the next update, so
+    // shortening it never lets the counter run past the new end (a 65 ms wrap of the 16-bit timer).
+    htim15.Instance->CR1 |= TIM_CR1_ARPE;
+    htim4.Instance->CR1 |= TIM_CR1_ARPE;
 }
 
 extern "C" void Sdram_Initialize() {
@@ -288,14 +327,26 @@ void HAL_TIM_ErrorCallback(TIM_HandleTypeDef* htim) {}
 // 1. Half Transfer (Process First 32 Samples)
 void HAL_I2SEx_TxRxHalfCpltCallback(I2S_HandleTypeDef* hi2s) {
     if (hi2s->Instance == SPI3) {
+#ifdef ENABLE_DCACHE
+        SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(&i2s_rxBuffer[0]), I2S_BLOCK_SIZE * 2 * sizeof(uint32_t));
+#endif
         controller.processAudioBlock(&i2s_rxBuffer[0], &i2s_txBuffer[0]);
+#ifdef ENABLE_DCACHE
+        SCB_CleanDCache_by_Addr(reinterpret_cast<uint32_t*>(&i2s_txBuffer[0]), I2S_BLOCK_SIZE * 2 * sizeof(uint32_t));
+#endif
     }
 }
 
 // 2. Complete Transfer (Process Second 32 Samples)
 void HAL_I2SEx_TxRxCpltCallback(I2S_HandleTypeDef* hi2s) {
     if (hi2s->Instance == SPI3) {
+#ifdef ENABLE_DCACHE
+        SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(&i2s_rxBuffer[I2S_BLOCK_SIZE * 2]), I2S_BLOCK_SIZE * 2 * sizeof(uint32_t));
+#endif
         controller.processAudioBlock(&i2s_rxBuffer[I2S_BLOCK_SIZE * 2], &i2s_txBuffer[I2S_BLOCK_SIZE * 2]);
+#ifdef ENABLE_DCACHE
+        SCB_CleanDCache_by_Addr(reinterpret_cast<uint32_t*>(&i2s_txBuffer[I2S_BLOCK_SIZE * 2]), I2S_BLOCK_SIZE * 2 * sizeof(uint32_t));
+#endif
     }
 }
 
@@ -332,6 +383,9 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef* huart) {
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
     if (huart == &huart1) {
+#ifdef ENABLE_DCACHE
+        SCB_InvalidateDCache_by_Addr(reinterpret_cast<uint32_t*>(&midiRxBox), sizeof midiRxBox);
+#endif
         controller.receiveMidiCommand();
         HAL_UART_Receive_DMA(&huart1, &midiRxData, 1);
     }
@@ -339,12 +393,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
     if (huart == &huart1) {
+        controller.midi_countRxError();  // overrun/framing: diagnostics
         HAL_UART_Receive_DMA(&huart1, &midiRxData, 1);
     }
 }
 
 void Error_Handler(void) {
     __disable_irq();
+    // Record who called it and restart (CrashRecord.h); a repeat during start-up stays here.
+    uint32_t frame[8] = {0};
+    frame[6] = reinterpret_cast<uint32_t>(__builtin_return_address(0));
+    Crash_Capture(frame, CRASH_ERROR_HANDLER);
     while (1) {
     }
 }

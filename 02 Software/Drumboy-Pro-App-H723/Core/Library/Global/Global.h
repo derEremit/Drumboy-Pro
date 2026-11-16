@@ -6,9 +6,28 @@
 #include <cmath>
 #include <random>
 
+#include "FileFormat.h"
 #include "Lfo.h"
 #include "MCP23017.h"
+#include "Autosave.h"
+#include "BeatNote.h"
+#include "CrashRecord.h"
+#include "LaneView.h"
+#include "LoadMeter.h"
+#include "FilterCurve.h"
+#include "StatusLine.h"
+#include "SampleView.h"
+#include "DubMix.h"
+#include "DubView.h"
+#include "NoteView.h"
+#include "Pan.h"
+#include "UndoLog.h"
 #include "Metronome.h"
+#include "MidiClock.h"
+#include "MidiParser.h"
+#include "Pitch.h"
+#include "Preview.h"
+#include "SongChain.h"
 #include "fatfs.h"
 #include "main.h"
 #include "sdmmc.h"
@@ -22,7 +41,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 const uint8_t kVersionMajor                         = 0x01;
-const uint8_t kVersionMinor                         = 0x0B;  // V1.11: factory V1.01 plus fixes, fork marker
+const uint8_t kVersionMinor                         = 0x10;  // V1.16, as FW_VERSION_MINOR in Version.h (read by Firmware/make_sd_package.py)
 
 ////////////////////////////////////////////////////////////////////////////////
 /* Application Address -------------------------------------------------------*/
@@ -103,12 +122,9 @@ void swap(T& a, T& b) {
     b = temp;
 }
 
-template <typename t>
-t clamp(t x, t min, t max) {
-    if (x < min) x = min;
-    if (x > max) x = max;
-    return x;
-}
+#include "Util.h"     // clamp()
+#include "PingPong.h"  // ping-pong echo
+#include "Routing.h"  // RouteNode, routing helpers
 
 template <typename T>
 int sgn(T val) {
@@ -156,7 +172,7 @@ typedef enum {
 #define CYCCNTENA                                   (1 << 0)
 #define DWT_LAR_UNLOCK                              (0xC5ACCE55)
 
-static void dwt_initialize() {
+static inline void dwt_initialize() {
     // 1. Enable the Debug Exception and Monitor Control Register (Trace unit)
     DEMCR |= TRCENA;
 
@@ -173,7 +189,7 @@ static inline uint32_t dwt_getMicros() {
     return DWT_CYCCNT / (SystemCoreClock / 1000000);
 }
 
-static void delay_us(uint32_t us) {
+static inline void delay_us(uint32_t us) {
     uint32_t startTick = DWT_CYCCNT;
     uint32_t ticks = us * (SystemCoreClock / 1000000);
 
@@ -339,7 +355,13 @@ const uint32_t kSampleByteSize                      = kSampleSize * 4;
 
 const uint8_t kSampleSectorLibrarySize              = 15;
 
+// A stereo sample keeps its two channels in one slot as two planes: the left channel at the start of
+// the slot, the right one half a slot later. Half the length (2.7 s), the same memory, 32-bit float.
+const uint32_t kStereoSampleSize                    = kSampleSize / 2;
+const uint32_t kStereoPlaneBytes                    = kStereoSampleSize * 4;
+
 struct SampleSector {
+    bool stereo = false;                            // two planes (kStereoPlaneBytes apart)
     bool active = false;
     uint8_t layer = 0;
     uint32_t size = 0;
@@ -364,6 +386,15 @@ const uint32_t kChorusByteSize                      = kChorusSize * 4;
 #define RAM_CHORUS_0                                RAM_CHORUS_ADDRESS
 #define RAM_CHORUS_1                                RAM_CHORUS_ADDRESS + (1 * kChorusByteSize)
 
+// Sample preview ring (Preview.h): in the unused gap after the chorus buffers (which end at
+// 0xC0EA6000) and before the images (0xC0FB9640). 65536 floats = 256 KB = 1.49 s at 44.1 kHz.
+#define RAM_PREVIEW_ADDRESS                         0xC0EA6000
+const uint32_t kPreviewRingSize                     = 65536;
+static_assert(0xC0EA6000u + kPreviewRingSize * 4u <= 0xC0FB9640u, "preview ring must end before the images");
+
+// Whole-bank clipboard (SONG page COPY/PASTE): one Bank per layer, right after the preview ring.
+#define RAM_BANK_CLIPBOARD_ADDRESS                  (0xC0EA6000u + kPreviewRingSize * 4u)
+
 #define RAM_IMAGE_LOGO_ADDRESS                      0xC0FB9640                  // 170px * 170px
 #define RAM_IMAGE_LOGO_PALETTE_ADDRESS              0xC0FB9640                  // 128 bytes
 #define RAM_IMAGE_LOGO_DATA_ADDRESS                 0xC0FB9640 + 128            // 28.900 bytes
@@ -385,6 +416,23 @@ const uint32_t kChorusByteSize                      = kChorusSize * 4;
 #define RAM_IMAGE_LAYER_B_DATA_ADDRESS              0xC0FEBEBC + 128            // 28.520 bytes
 
 //                                                  0xC0FF2EA4 - 0xC0FFFFFF     : 53.595 bytes free
+
+// Scratch for the full-area views, in that free tail: the two filter curves as drawn (their y per
+// point), so a changed curve is erased by redrawing it instead of clearing the whole plot. +2048:
+// the sample view's 840 peak columns.
+// Stereo audio work memory in the DTCM RAM (zero wait states, only the CPU uses it): the right
+// channel of the EQ, Filter 1, Filter 2, Effect 1 and Effect 2 nodes (the reverb has its own pair),
+// and what each layer's route and pan gains reached in the last block. Zeroed at start-up (main.cpp).
+struct StereoDsp {
+    float nodeR[5][I2S_BLOCK_SIZE];
+    float srcGain[10][kRouteGainStateSize];
+    float layerR[10][I2S_BLOCK_SIZE];               // the right channel of a layer playing a stereo sample
+    bool layerStereo[10];                           // which layers did this block
+};
+extern StereoDsp stereoDsp;
+
+#define RAM_VIEW_SCRATCH_ADDRESS                    0xC0FF3000u
+static_assert((RAM_VIEW_SCRATCH_ADDRESS >= 0xC0FF2EA4u) && (RAM_VIEW_SCRATCH_ADDRESS + 4096u <= 0xC0FFFFF0u), "view scratch must fit the free tail of the SDRAM");
 
 ////////////////////////////////////////////////////////////////////////////////
 /* Sdram Constants -----------------------------------------------------------*/
@@ -851,12 +899,11 @@ const char kHeaderDepth[]                           = "DEPTH     ";
 const char kHeaderDirection[]                       = "DIRECTION ";
 const char kHeaderDry[]                             = "DRY       ";
 const char kHeaderDrive[]                           = "DRIVE     ";
-const char kHeaderEffect[]                          = "EFFECT    ";
 const char kHeaderEnd[]                             = "END       ";
-const char kHeaderEq[]                              = "PARAM EQ  ";
+const char kHeaderOut[]                             = "OUT       ";
+const char kHeaderStyle[]                           = "STYLE     ";
 const char kHeaderFeedback[]                        = "FEEDBACK  ";
 const char kHeaderFill[]                            = "FILL      ";
-const char kHeaderFilter[]                          = "FILTER    ";
 const char kHeaderFrequency[]                       = "FREQUENCY";
 const char kHeaderHighshelf[]                       = "HI-SHELF  ";
 const char kHeaderInst[]                            = "INST      ";
@@ -888,7 +935,6 @@ const char kHeaderPrecount[]                        = "PRECOUNT  ";
 const char kHeaderRate[]                            = "RATE      ";
 const char kHeaderResolution[]                      = "RESOLUTION";
 const char kHeaderResonance[]                       = "RESONANCE";
-const char kHeaderReverb[]                          = "REVERB    ";
 const char kHeaderProbability[]                     = "PROB      ";
 const char kHeaderQfactor[]                         = "Q-FACTOR  ";
 const char kHeaderQuantize[]                        = "QUANTIZE  ";
@@ -905,8 +951,13 @@ const char kHeaderTemp[]                            = "TEMP      ";
 const char kHeaderTempo[]                           = "TEMPO     ";
 const char kHeaderTime[]                            = "TIME      ";
 const char kHeaderType[]                            = "TYPE      ";
+const char kHeaderMove[]                            = "MOVE      ";
+const char kHeaderShiftAll[]                        = "SHIFT ALL ";
 const char kHeaderVelocity[]                        = "VELOCITY  ";
 const char kHeaderVolume[]                          = "VOLUME    ";
+const char kHeaderPreview[]                         = "PREVIEW   ";
+const char kHeaderPreviewLevel[]                    = "PREV LEVEL";
+const char kHeaderAutosave[]                        = "AUTOSAVE  ";
 const char kHeaderWet[]                             = "WET       ";
 
 const char kHeaderLow[]                             = "LOW       ";
@@ -1192,17 +1243,72 @@ typedef enum {
 
     ENC_INST_2_INST                                 = 0x57,
     ENC_INST_2_SAMPLE                               = 0x58,
-    ENC_INST_2_EQ                                   = 0x59,
-    ENC_INST_2_FILTER                               = 0x5A,
-    ENC_INST_2_EFFECT                               = 0x5B,
-    ENC_INST_2_REVERB                               = 0x5C,
+    ENC_INST_2_OUT                                  = 0x59,  // layer destination (was EQ)
+    ENC_INST_2_UNUSED_5A                            = 0x5A,  // was FILTER; kept so later function numbers stay put
+    ENC_INST_2_UNUSED_5B                            = 0x5B,  // was EFFECT
+    ENC_INST_2_UNUSED_5C                            = 0x5C,  // was REVERB
 
     ENC_SONG_FILL                                   = 0x5D,
     ENC_SONG_PATTERN                                = 0x5E,
     ENC_SONG_TIMING                                 = 0x5F,
     ENC_SONG_VELOCITY                               = 0x60,
 
-    ENC_FNC_NONE                                    = 0x61
+    ENC_FNC_NONE                                    = 0x61,
+
+    ENC_ROUTE_EQ_OUT                                = 0x62,
+    ENC_ROUTE_F1_OUT                                = 0x63,
+    ENC_ROUTE_F2_OUT                                = 0x64,
+    ENC_ROUTE_FX1_OUT                               = 0x65,
+    ENC_ROUTE_FX2_OUT                               = 0x66,
+    ENC_ROUTE_METRO_OUT                             = 0x67,
+    ENC_ROUTE_LINEIN_OUT                            = 0x68,
+
+    ENC_SONG_MOVE                                   = 0x69,  // move the selected beat (Layer Song tab 6)
+    ENC_SONG_SHIFT                                  = 0x6A,  // shift the whole layer (Layer Song tab 7)
+
+    ENC_EUC_STEPS                                   = 0x6B,
+    ENC_EUC_HITS                                    = 0x6C,
+    ENC_EUC_ROTATE                                  = 0x6D,
+    ENC_EUC_GRID                                    = 0x6E,
+    ENC_EUC_MODE                                    = 0x6F,
+    ENC_EUC_ACCENTS                                 = 0x70,
+
+    ENC_METRO_PREVIEW                               = 0x71,  // sample preview on/off (Metronome tab 4)
+    ENC_METRO_PREVIEW_LEVEL                         = 0x72,  // sample preview level (Metronome tab 5)
+
+    ENC_CHAIN_STEP                                  = 0x73,  // song mode (SONG page)
+    ENC_CHAIN_BANK                                  = 0x74,
+    ENC_CHAIN_REPEATS                               = 0x75,
+    ENC_CHAIN_LENGTH                                = 0x76,
+    ENC_CHAIN_END                                   = 0x77,
+    ENC_CHAIN_PLAY                                  = 0x78,
+
+    ENC_METRO_AUTOSAVE                              = 0x79,  // autosave interval (Metronome tab 6)
+
+    ENC_NOTE_BEAT                                   = 0x7A,  // NOTE page (BeatNote.h)
+    ENC_NOTE_VEL                                    = 0x7B,
+    ENC_NOTE_PROB                                   = 0x7C,
+    ENC_NOTE_COND                                   = 0x7D,
+    ENC_NOTE_NUDGE                                  = 0x7E,
+
+    ENC_INST_2_STYLE                                = 0x7F,  // layer STYLE (page 3; the left S key is SOLO since V1.14)
+
+    ENC_DUB_LEVEL                                   = 0x80,  // DUB page (DubMix.h): the selected strip, then the desk
+    ENC_DUB_BUS                                     = 0x81,
+    ENC_DUB_ECHO                                    = 0x82,
+    ENC_DUB_VERB                                    = 0x83,
+    ENC_DUB_MODE                                    = 0x84,
+    ENC_DUB_FEEDBACK                                = 0x85,
+    ENC_DUB_ECHORTN                                 = 0x86,
+    ENC_DUB_VERBRTN                                 = 0x87,
+
+    ENC_INST_2_PAN                                  = 0x88,  // layer PAN (page 3, Pan.h)
+
+    ENC_DUB_PAN                                     = 0x89,  // DUB page 2: the selected strip's pan and FX send, then the echo's width
+    ENC_DUB_FX                                      = 0x8A,
+    ENC_DUB_WIDTH                                   = 0x8B,
+
+    kEncoderFuncCount                                        // table size check
 } EncoderFunc;
 
 const EncoderFunc encoderLocalFunction[][8] = {
@@ -1219,7 +1325,7 @@ const EncoderFunc encoderLocalFunction[][8] = {
     // RHYTHM_MENU = 0x05
     {ENC_RHYTHM_TEMPO, ENC_RHYTHM_MEASURE, ENC_RHYTHM_BAR, ENC_RHYTHM_QUANTIZE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE},
     // METRO_MENU = 0x06
-    {ENC_METRO_ACTIVE, ENC_METRO_PRECOUNT, ENC_METRO_SAMPLE, ENC_METRO_VOLUME, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE},
+    {ENC_METRO_ACTIVE, ENC_METRO_PRECOUNT, ENC_METRO_SAMPLE, ENC_METRO_VOLUME, ENC_METRO_PREVIEW, ENC_METRO_PREVIEW_LEVEL, ENC_METRO_AUTOSAVE, ENC_FNC_NONE},
     // IO_MENU = 0x07
     {ENC_IO_SYNCIN, ENC_IO_SYNCOUT, ENC_IO_MIDIIN, ENC_IO_MIDIOUT, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE},
     // FILTER_0_MENU = 0x08
@@ -1241,11 +1347,31 @@ const EncoderFunc encoderLocalFunction[][8] = {
     // LAYER_INST_1_MENU = 0x10
     {ENC_INST_1_INST, ENC_INST_1_SAMPLE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_INST_1_START, ENC_INST_1_END, ENC_INST_1_TIMING, ENC_INST_1_PROB},
     // LAYER_INST_2_MENU = 0x11
-    {ENC_INST_2_INST, ENC_INST_2_SAMPLE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_INST_2_EQ, ENC_INST_2_FILTER, ENC_INST_2_EFFECT, ENC_INST_2_REVERB},
+    {ENC_INST_2_INST, ENC_INST_2_SAMPLE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_INST_2_OUT, ENC_INST_2_STYLE, ENC_INST_2_PAN, ENC_FNC_NONE},
     // LAYER_SONG_MENU = 0x12
-    {ENC_SONG_FILL, ENC_SONG_PATTERN, ENC_FNC_NONE, ENC_FNC_NONE, ENC_SONG_TIMING, ENC_SONG_VELOCITY, ENC_FNC_NONE, ENC_FNC_NONE},
+    // Tabs 2-3 hold the fill graph.
+    {ENC_SONG_FILL, ENC_SONG_PATTERN, ENC_FNC_NONE, ENC_FNC_NONE, ENC_SONG_TIMING, ENC_SONG_VELOCITY, ENC_SONG_MOVE, ENC_SONG_SHIFT},
     // TEST_MENU = 0x13
-    {ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE}};
+    {ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE},
+    // ROUTING_MENU = 0x14
+    // Tabs 2-3 show the chain overview; line-in is set on the mixer page (MIXER IN).
+    {ENC_ROUTE_EQ_OUT, ENC_ROUTE_F1_OUT, ENC_FNC_NONE, ENC_FNC_NONE, ENC_ROUTE_F2_OUT, ENC_ROUTE_FX1_OUT, ENC_ROUTE_FX2_OUT, ENC_ROUTE_METRO_OUT},
+    // EUCLID_MENU = 0x15
+    // Tabs 2-3 show the pattern.
+    {ENC_EUC_STEPS, ENC_EUC_HITS, ENC_FNC_NONE, ENC_FNC_NONE, ENC_EUC_ROTATE, ENC_EUC_GRID, ENC_EUC_MODE, ENC_EUC_ACCENTS},
+    // SONG_MENU = 0x16
+    // Tabs 2-3 show the chain.
+    {ENC_CHAIN_STEP, ENC_CHAIN_BANK, ENC_FNC_NONE, ENC_FNC_NONE, ENC_CHAIN_REPEATS, ENC_CHAIN_LENGTH, ENC_CHAIN_END, ENC_CHAIN_PLAY},
+    // NOTE_MENU = 0x17
+    // Tabs 2-3 show the selected note.
+    {ENC_NOTE_BEAT, ENC_NOTE_VEL, ENC_FNC_NONE, ENC_FNC_NONE, ENC_NOTE_PROB, ENC_NOTE_COND, ENC_NOTE_NUDGE, ENC_FNC_NONE},
+    // DUB_MENU = 0x18
+    // Top row: the selected strip. Bottom row: the desk.
+    {ENC_DUB_LEVEL, ENC_DUB_BUS, ENC_DUB_ECHO, ENC_DUB_VERB, ENC_DUB_MODE, ENC_DUB_FEEDBACK, ENC_DUB_ECHORTN, ENC_DUB_VERBRTN}};
+
+// DUB page 2 (the next step in the MIXER cycle): the selected strip's pan and FX send on the top row,
+// the echo's width on the bottom row.
+const EncoderFunc kDubPage2Function[8] = {ENC_DUB_PAN, ENC_DUB_FX, ENC_FNC_NONE, ENC_FNC_NONE, ENC_DUB_WIDTH, ENC_FNC_NONE, ENC_FNC_NONE, ENC_FNC_NONE};
 
 struct EncoderFuncData {
     EncoderFunc function;
@@ -1347,7 +1473,7 @@ const EncoderFuncData kEncoderFuncDataLibrary[] = {
     {ENC_INST_0_INST,         ENC_RES_M, "INST      ", "LAYER ", "   ", false},
     {ENC_INST_0_SAMPLE,       ENC_RES_M, "SAMPLE    ", "LAYER ", "   ", false},
     {ENC_INST_0_LEVEL,        ENC_RES_F, "LEVEL     ", "LAYER ", "  %", false},
-    {ENC_INST_0_PITCH,        ENC_RES_F, "PITCH     ", "LAYER ", "  %", false},
+    {ENC_INST_0_PITCH,        ENC_RES_M, "PITCH     ", "LAYER ", "  %", false},
     {ENC_INST_0_DIRECT,       ENC_RES_S, "DIRECTION ", "LAYER ", "   ", false},
     {ENC_INST_0_RESOL,        ENC_RES_F, "RESOLUTION", "LAYER ", "BIT", false},
 
@@ -1360,16 +1486,74 @@ const EncoderFuncData kEncoderFuncDataLibrary[] = {
 
     {ENC_INST_2_INST,         ENC_RES_M, "INST      ", "LAYER ", "   ", false},
     {ENC_INST_2_SAMPLE,       ENC_RES_M, "SAMPLE    ", "LAYER ", "   ", false},
-    {ENC_INST_2_EQ,           ENC_RES_S, "EQ        ", "LAYER ", " IN", false},
-    {ENC_INST_2_FILTER,       ENC_RES_S, "FILTER    ", "LAYER ", " IN", false},
-    {ENC_INST_2_EFFECT,       ENC_RES_S, "EFFECT    ", "LAYER ", " IN", false},
-    {ENC_INST_2_REVERB,       ENC_RES_S, "REVERB    ", "LAYER ", " IN", false},
+    {ENC_INST_2_OUT,          ENC_RES_S, "OUT       ", "LAYER ", "   ", false},
+    {ENC_INST_2_UNUSED_5A,    ENC_RES_S, "          ", "LAYER ", "   ", false},
+    {ENC_INST_2_UNUSED_5B,    ENC_RES_S, "          ", "LAYER ", "   ", false},
+    {ENC_INST_2_UNUSED_5C,    ENC_RES_S, "          ", "LAYER ", "   ", false},
 
     {ENC_SONG_FILL,           ENC_RES_M, "FILL      ", "SONG  ", "   ", false},
     {ENC_SONG_PATTERN,        ENC_RES_M, "PATTERN   ", "SONG  ", "   ", false},
     {ENC_SONG_TIMING,         ENC_RES_M, "TIMING    ", "SONG  ", "   ", false},
-    {ENC_SONG_VELOCITY,       ENC_RES_M, "VELOCITY  ", "SONG  ", "   ", false}
+    {ENC_SONG_VELOCITY,       ENC_RES_M, "VELOCITY  ", "SONG  ", "   ", false},
+
+    // 0x61: empty slot. Lookups of ENC_FNC_NONE used to read one past the end of this table.
+    {ENC_FNC_NONE,            ENC_RES_F, "----------", "      ", "   ", false},
+
+    {ENC_ROUTE_EQ_OUT,        ENC_RES_S, "EQ        ", "ROUTE ", "OUT", false},
+    {ENC_ROUTE_F1_OUT,        ENC_RES_S, "FILTER-1  ", "ROUTE ", "OUT", false},
+    {ENC_ROUTE_F2_OUT,        ENC_RES_S, "FILTER-2  ", "ROUTE ", "OUT", false},
+    {ENC_ROUTE_FX1_OUT,       ENC_RES_S, "EFFECT-1  ", "ROUTE ", "OUT", false},
+    {ENC_ROUTE_FX2_OUT,       ENC_RES_S, "EFFECT-2  ", "ROUTE ", "OUT", false},
+    {ENC_ROUTE_METRO_OUT,     ENC_RES_S, "METRONOME ", "ROUTE ", "OUT", false},
+    {ENC_ROUTE_LINEIN_OUT,    ENC_RES_S, "LINE-IN   ", "ROUTE ", "OUT", false},
+
+    {ENC_SONG_MOVE,           ENC_RES_M, "MOVE      ", "SONG  ", "   ", false},
+    {ENC_SONG_SHIFT,          ENC_RES_M, "SHIFT ALL ", "SONG  ", "   ", false},
+
+    {ENC_EUC_STEPS,           ENC_RES_M, "STEPS     ", "EUCLID", "   ", false},
+    {ENC_EUC_HITS,            ENC_RES_M, "HITS      ", "EUCLID", "   ", false},
+    {ENC_EUC_ROTATE,          ENC_RES_M, "ROTATE    ", "EUCLID", "   ", false},
+    {ENC_EUC_GRID,            ENC_RES_M, "GRID      ", "EUCLID", "   ", false},
+    {ENC_EUC_MODE,            ENC_RES_M, "MODE      ", "EUCLID", "   ", false},
+    {ENC_EUC_ACCENTS,         ENC_RES_M, "ACCENTS   ", "EUCLID", "   ", false},
+
+    {ENC_METRO_PREVIEW,       ENC_RES_S, "PREVIEW   ", "METRO ", "   ", false},
+    {ENC_METRO_PREVIEW_LEVEL, ENC_RES_F, "PREV LEVEL", "METRO ", "  %", false},
+
+    {ENC_CHAIN_STEP,          ENC_RES_M, "STEP      ", "SONG  ", "   ", false},
+    {ENC_CHAIN_BANK,          ENC_RES_M, "BANK      ", "SONG  ", "   ", false},
+    {ENC_CHAIN_REPEATS,       ENC_RES_M, "REPEATS   ", "SONG  ", "   ", false},
+    {ENC_CHAIN_LENGTH,        ENC_RES_M, "LENGTH    ", "SONG  ", "   ", false},
+    {ENC_CHAIN_END,           ENC_RES_S, "END       ", "SONG  ", "   ", false},
+    {ENC_CHAIN_PLAY,          ENC_RES_S, "CHAIN     ", "SONG  ", "   ", false},
+
+    {ENC_METRO_AUTOSAVE,      ENC_RES_S, "AUTOSAVE  ", "METRO ", "MIN", false},
+
+    {ENC_NOTE_BEAT,           ENC_RES_M, "NOTE      ", "NOTE  ", "   ", false},
+    {ENC_NOTE_VEL,            ENC_RES_F, "VELOCITY  ", "NOTE  ", "   ", false},
+    {ENC_NOTE_PROB,           ENC_RES_M, "CHANCE    ", "NOTE  ", "  %", false},
+    {ENC_NOTE_COND,           ENC_RES_M, "CONDITION ", "NOTE  ", "   ", false},
+    {ENC_NOTE_NUDGE,          ENC_RES_M, "NUDGE     ", "NOTE  ", "  %", false},
+
+    {ENC_INST_2_STYLE,        ENC_RES_S, "STYLE     ", "LAYER ", "   ", false},
+
+    {ENC_DUB_LEVEL,           ENC_RES_M, "LEVEL     ", "DUB   ", "  %", false},
+    {ENC_DUB_BUS,             ENC_RES_S, "BUS       ", "DUB   ", "   ", false},
+    {ENC_DUB_ECHO,            ENC_RES_M, "ECHO      ", "DUB   ", "  %", false},
+    {ENC_DUB_VERB,            ENC_RES_M, "VERB      ", "DUB   ", "  %", false},
+    {ENC_DUB_MODE,            ENC_RES_S, "MODE      ", "DUB   ", "   ", false},
+    {ENC_DUB_FEEDBACK,        ENC_RES_M, "FEEDBACK  ", "DUB   ", "  %", false},
+    {ENC_DUB_ECHORTN,         ENC_RES_M, "ECHO RTN  ", "DUB   ", "  %", false},
+    {ENC_DUB_VERBRTN,         ENC_RES_M, "VERB RTN  ", "DUB   ", "  %", false},
+
+    {ENC_INST_2_PAN,          ENC_RES_M, "PAN       ", "LAYER ", "   ", false},
+
+    {ENC_DUB_PAN,             ENC_RES_M, "PAN       ", "DUB   ", "   ", false},
+    {ENC_DUB_FX,              ENC_RES_M, "FX SEND   ", "DUB   ", "  %", false},
+    {ENC_DUB_WIDTH,           ENC_RES_M, "ECHO WIDTH", "DUB   ", "  %", false}
 };
+
+static_assert(sizeof(kEncoderFuncDataLibrary) / sizeof(kEncoderFuncDataLibrary[0]) == kEncoderFuncCount, "kEncoderFuncDataLibrary is indexed by EncoderFunc: one entry per value");
 
 typedef enum {
     ENC_MODE_GLOBAL                                 = 0x00,
@@ -1490,7 +1674,12 @@ typedef enum {
     LAYER_INST_1_MENU                               = 0x10,
     LAYER_INST_2_MENU                               = 0x11,
     LAYER_SONG_MENU                                 = 0x12,
-    TEST_MENU                                       = 0x13
+    TEST_MENU                                       = 0x13,
+    ROUTING_MENU                                    = 0x14,  // MIXER pressed again
+    EUCLID_MENU                                     = 0x15,  // LAYER SONG tapped on the Layer Song page
+    SONG_MENU                                       = 0x16,  // song mode: the SONG key tapped on its own
+    NOTE_MENU                                       = 0x17,  // per-note settings: LAYER SONG tapped on the EUCLID page
+    DUB_MENU                                        = 0x18   // the dub mixer: the second page of the MIXER key (DubMix.h)
 } Menu;
 
 typedef enum {
@@ -1525,6 +1714,8 @@ typedef enum {
     ALERT_CLEARSUCCESS                              = 0x16,
     ALERT_CLEARERROR                                = 0x17,
     ALERT_SHUTDOWN                                  = 0x18,
+    ALERT_RESTOREAUTOSAVE                           = 0x19,
+    ALERT_CRASH                                     = 0x1A,  // the last crash (CrashRecord.h), until ADD or CLEAR
     ALERT_OFF                                       = 0x20
 } AlertType;
 
@@ -1532,6 +1723,7 @@ const char kAlertTextResetPlay[]                    = "RESET PLAY?";
 
 const char kAlertTextNewFile[]                      = "NEW FILE?";
 const char kAlertTextLoadFile[]                     = "LOAD FILE?";
+const char kAlertTextRestoreAutosave[]              = "RESTORE AUTOSAVE?";
 const char kAlertTextSaveFile[]                     = "SAVE FILE?";
 const char kAlertTextClearFile[]                    = "CLEAR FILE?";
 const char kAlertTextOverwriteFile[]                = "OVERWRITE FILE?";
@@ -1714,6 +1906,7 @@ const uint8_t kHeadPhoneDecibelData[]               = {0x7F, 0x4C, 0x40, 0x39, 0
 const char kFileRef[]                               = "RW_DRUMBOYPRO_FILE       ";
 const char kFileStart[]                             = "System/File/File_";
 const char kFileEnd[]                               = ".rwf";
+const char* const kAutosavePath[2]                  = {"System/File/Autosave_A.rwf", "System/File/Autosave_B.rwf"};
 
 const uint16_t kFileByteSize                        = 14360;
 const uint8_t kFileLibrarySize                      = 100;
@@ -1763,7 +1956,11 @@ const char kDataSong[kSongByteSize + 1]             = "lb                       
 const char kSystemPresetRef[]                       = "RW_DRUMBOYPRO_PRESET_SYS ";
 const char kSystemPresetFilename[]                  = "System/Preset/System.rwp";
 
-const uint8_t kSystemPresetDataSize                 = 21;
+// 21 bytes up to V1.10; 21-22 (sample preview on/off and level) added in V1.11. Older 21-byte
+// files still load: the missing bytes keep their defaults.
+const uint8_t kSystemPresetDataSize                 = 24;   // V1.13: + byte 23 autosave interval
+const uint8_t kSystemPresetDataSizeV111             = 23;   // V1.11-V1.12: + bytes 21-22 sample preview
+const uint8_t kSystemPresetDataSizeV110             = 21;
 
 const char kEncoderPresetRef[]                      = "RW_DRUMBOYPRO_PRESET_ENC ";
 const char kEncoderPresetFilename[]                 = "System/Preset/Encoder.rwp";
@@ -1910,18 +2107,19 @@ const MixerLiVolume kMixerLiVolumeDataLibrary[] = {
     {"       -01", kLiBase * 0.8912509f}, 
     {"       +00", kLiBase * 1.0000000f}};
 
-struct MixerLiMixerIn {
+// Destination names (Routing.h node order), shared by every OUT / MIXER IN field.
+struct RouteDestData {
     char nameLongR[11];
 };
 
-const struct MixerLiMixerIn kMixerLiMixerInDataLibrary[] = {
+const struct RouteDestData kRouteDestDataLibrary[kRouteNodeCount] = {
     {"        EQ"},
     {"  FILTER-1"},
     {"  FILTER-2"},
     {"  EFFECT-1"},
     {"  EFFECT-2"},
     {"    REVERB"},
-    {"      SEND"}};
+    {"    MASTER"}};
 
 struct MixerPanData {
     char nameLongR[11];
@@ -2064,6 +2262,9 @@ const uint8_t kInitialQuantize                      = 2;
 
 const uint16_t kMeasureInterval                     = 800;
 const uint16_t kMeasureHalfInterval                 = kMeasureInterval / 2;
+const uint16_t kUndoEntries                         = 64;      // undo steps of one bank (UndoLog.h), stored in SDRAM
+const uint32_t kClockLockMinPeriodUs                = 40;      // sequencer timer limits while locked to MIDI clock
+const uint32_t kClockLockMaxPeriodUs                = 60000;   // (TIM15 counts microseconds, 16 bits)
 const uint16_t kMinSongInterval                     = 800;
 const uint16_t kMaxSongInterval                     = 64000;
 const float kQuantizeInterval[]                     = {50, 100, 200, 400, 800, 1600, 3200};
@@ -2285,18 +2486,15 @@ struct Midi {
     uint8_t rxChannel                               = 0;
     uint8_t txChannel                               = 0;
 
-    uint8_t rxNoteOnReadStage                       = 0;
-    uint8_t rxNoteOnWriteFlag                       = 0;
-    uint8_t rxNoteOnKey                             = 0;
-    uint8_t rxNoteOnVelocity                        = 0;
-
-    uint8_t rxNoteOffReadStage                      = 0;
-    uint8_t rxNoteOffWriteFlag                      = 0;
-    uint8_t rxNoteOffKey                            = 0;
-    uint8_t rxNoteOffVelocity                       = 0;
+    // MIDI IN (MidiParser.h): parser state in the UART interrupt, received notes queued for the
+    // main loop, receive errors (UART overrun/framing, full queue) for the diagnostics display.
+    MidiParser rxParser;
+    MidiQueue<16> rxNoteQueue;
+    volatile uint32_t rxErrors                      = 0;
 
     bool txTriggerNoteOn[10]                        = {false};
     bool txTriggerNoteOff[10]                       = {false};
+    volatile uint8_t txVelocity[10]                 = {127, 127, 127, 127, 127, 127, 127, 127, 127, 127};
 
     const uint8_t txData[10]                        = {0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D};
 
@@ -2308,13 +2506,16 @@ struct Midi {
     volatile bool rxTrigResetFlag                   = false;
     volatile bool rxTrigRecordFlag                  = false;
 
-    uint8_t rxSysExStage                            = 0;
-    uint8_t rxSysExCmd                              = 0;
-
-    uint8_t rxClockCount                            = 0;                // 0 = idle; 1–24 = counting within one beat
     volatile uint8_t rxClockTickPhase               = 0;                // 0 = beat boundary, 1-23 = in-between MIDI clocks
-    volatile uint32_t rxClockBeatStart              = 0;                // HAL_GetTick() at the start of beat measurement
-    volatile uint16_t rxClockBpm                    = 0;                // BPM computed from last full 24-clock beat
+    volatile uint16_t rxClockBpm                    = 0;                // measured tempo, rounded, for the display and effects
+    uint8_t rxClockBpmCount                         = 0;                // clocks since the last tempo report
+
+    // Clock slave lock (MidiClock.h): while clockLocked, the sequencer only plays as far as the
+    // incoming clock allows. Engaged on START/CONTINUE or when playing with the clock running.
+    MidiClockLock clockLock;
+    volatile bool clockLocked                       = false;
+    volatile bool clockStartedByMidi                = false;            // START/arm set the lock origin: play() keeps it
+    volatile uint32_t rxLastClockMs                 = 0;                // HAL_GetTick() of the last clock received
     volatile bool rxClockFlag                       = false;            // New BPM value ready for the main loop
     volatile bool rxTransportRunning                = false;
     volatile bool rxStartFlag                       = false;
@@ -2368,7 +2569,7 @@ struct Io {
     Sync sync;
 };
 
-static void clearMidiArmedState(bool& playArmed_, bool& recordArmed_, Icon& playIcon_, Icon& recordIcon_, bool& textClearFlag_) {
+static inline void clearMidiArmedState(bool& playArmed_, bool& recordArmed_, Icon& playIcon_, Icon& recordIcon_, bool& textClearFlag_) {
     if (!playArmed_ && !recordArmed_) return;
 
     playArmed_ = false;
@@ -2441,7 +2642,7 @@ const uint8_t kMinFilterType                        = 1;
 const uint8_t kMaxFilterType                        = 4;
 
 const uint8_t kMinFilterSlope                       = 0;
-const uint8_t kMaxFilterSlope                       = 1;
+const uint8_t kMaxFilterSlope                       = 2;                        // 06, 12, 24 dB per octave
 
 const uint8_t kMinFilterFrequency                   = 0;
 const uint8_t kMaxFilterFrequency                   = 199;
@@ -2496,7 +2697,8 @@ struct FilterSlopeData {
 
 const struct FilterSlopeData kFilterSlopeDataLibrary[] = {
     {"        06"}, 
-    {"        12"}};
+    {"        12"}, 
+    {"        24"}};
 
 struct FilterFrequencyData {
     char nameLongR[11];
@@ -2658,6 +2860,12 @@ struct FilterMixTransition {
     FilterTransitionAction actionWet;
 };
 
+// The history of one channel of a filter: the first section (x, y) and the second one (u, v: the 24 dB slope).
+struct FilterState {
+    float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+    float u1 = 0.0f, u2 = 0.0f, v1 = 0.0f, v2 = 0.0f;
+};
+
 struct Filter {
     uint8_t num;
     bool active;
@@ -2685,11 +2893,8 @@ struct Filter {
     float a1                                        = 0.0f;
     float a2                                        = 0.0f;
 
-    // history (States)
-    float x1                                        = 0.0f;
-    float x2                                        = 0.0f;
-    float y1                                        = 0.0f;
-    float y2                                        = 0.0f;
+    // history (states): one set per channel, left then right (the filter is stereo since V1.15)
+    FilterState state[2];
 
     void initialize() {
         active = kInitialFilterActive;
@@ -2708,87 +2913,27 @@ struct Filter {
         cleanMemory();
     }
 
+    // Second section (the 24 dB slope).
+    BiquadCoef stage2;
+    uint8_t stages                                  = 1;
+
     void calculateCoef() {
-        float freq = (float)kFilterFrequencyDataLibrary[frequency].data;
-        float Q = kFilterResonanceDataLibrary[resonance].data;
-        float cosw0, alpha;
-        float b0_tmp, b1_tmp, b2_tmp; 
-        float a0_tmp, a1_tmp, a2_tmp;
-        float normFreq = freq * kInvSampleRate;
-        cosw0 = cosFast(normFreq);
-        float sinw0 = sinFast(normFreq);
-        alpha = sinw0 / (2.0f * Q);
-
-        switch (type) {
-            case FIL_OFF:
-                b0_tmp = 1.0f;
-                b1_tmp = 0.0f;
-                b2_tmp = 0.0f;
-                a0_tmp = 1.0f;
-                a1_tmp = 0.0f;
-                a2_tmp = 0.0f;
-                break;
-
-            case FIL_LPF:
-                b0_tmp = (1.0f - cosw0) * 0.5f;
-                b1_tmp = 1.0f - cosw0;
-                b2_tmp = (1.0f - cosw0) * 0.5f;
-                a0_tmp = 1.0f + alpha;
-                a1_tmp = -2.0f * cosw0;
-                a2_tmp = 1.0f - alpha;
-                break;
-
-            case FIL_HPF:
-                b0_tmp = (1.0f + cosw0) * 0.5f;
-                b1_tmp = -(1.0f + cosw0);
-                b2_tmp = (1.0f + cosw0) * 0.5f;
-                a0_tmp = 1.0f + alpha;
-                a1_tmp = -2.0f * cosw0;
-                a2_tmp = 1.0f - alpha;
-                break;
-
-            case FIL_BPF:
-                b0_tmp = alpha;
-                b1_tmp = 0.0f;
-                b2_tmp = -alpha;
-                a0_tmp = 1.0f + alpha;
-                a1_tmp = -2.0f * cosw0;
-                a2_tmp = 1.0f - alpha;
-                break;
-
-            case FIL_BSF:  // Notch
-                b0_tmp = 1.0f;
-                b1_tmp = -2.0f * cosw0;
-                b2_tmp = 1.0f;
-                a0_tmp = 1.0f + alpha;
-                a1_tmp = -2.0f * cosw0;
-                a2_tmp = 1.0f - alpha;
-                break;
-
-            default:  // Pass-through
-                b0_tmp = 1.0f;
-                b1_tmp = 0.0f;
-                b2_tmp = 0.0f;
-                a0_tmp = 1.0f;
-                a1_tmp = 0.0f;
-                a2_tmp = 0.0f;
-                break;
-        }
-
-        // Normalize
-        float invA0 = 1.0f / a0_tmp;
-        b0 = b0_tmp * invA0;
-        b1 = b1_tmp * invA0;
-        b2 = b2_tmp * invA0;
-        a1 = a1_tmp * invA0;
-        a2 = a2_tmp * invA0;
+        // The design is in FilterCurve.h, shared with the curve on the filter page.
+        BiquadCoef first, second;
+        const uint8_t count = filterDesign(type, slope, (float)kFilterFrequencyDataLibrary[frequency].data, kFilterResonanceDataLibrary[resonance].data,
+                                           AUDIO_SAMPLE_RATE, first, second);
+        b0 = first.b0;
+        b1 = first.b1;
+        b2 = first.b2;
+        a1 = first.a1;
+        a2 = first.a2;
+        stage2 = second;
+        stages = count;
     }
 
     void cleanMemory() {
-        x1 = 0.0f;
-        x2 = 0.0f;
-        y1 = 0.0f;
-        y2 = 0.0f;
+        state[0] = FilterState();
+        state[1] = FilterState();
     }
 
     Filter(uint8_t num_) : num(num_) {}
@@ -2995,6 +3140,11 @@ struct EqGenTransition {
     EqTransitionAction actionWet;
 };
 
+// The history of one biquad of the EQ's right channel (the left channel keeps its history in its EqFilter).
+struct EqState {
+    float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+};
+
 struct Eq {
     bool active                                     = kInitialEqActive;
 
@@ -3014,6 +3164,7 @@ struct Eq {
     uint8_t gainPeak[4]                             = {kInitialEqGainPeak[0], kInitialEqGainPeak[1], kInitialEqGainPeak[2], kInitialEqGainPeak[3]};
 
     EqFilter filterPeak[4];
+    EqState right[6];                               // right channel: low shelf, high shelf, peaks 1-4 (same coefficients as the left)
 
     void initialize() {
         active = kInitialEqActive;
@@ -3139,9 +3290,21 @@ struct Eq {
             filterPeak[i].x2 = 0;
             filterPeak[i].y1 = 0;
             filterPeak[i].y2 = 0;
-        }
+            for (uint8_t k = 0; k < 6; k++) right[k] = EqState();
+    }
     }
 };
+
+// The same biquad for the right channel: the left channel's coefficients, the right channel's own history.
+static inline float processEqBiquadRight(const EqFilter& f, EqState& s, float input, bool active) {
+    if (!active) return input;
+    const float output = (f.b0 * input) + (f.b1 * s.x1) + (f.b2 * s.x2) - (f.a1 * s.y1) - (f.a2 * s.y2) + EQ_ANTI_DENORMAL;
+    s.x2 = s.x1;
+    s.x1 = input;
+    s.y2 = s.y1;
+    s.y1 = output;
+    return output;
+}
 
 static inline float processEqBiquad(EqFilter& f, float input, bool active) {
     if (!active) return input;
@@ -6091,8 +6254,10 @@ struct Lfo {
 const uint8_t kMinLayerLevel                        = 0;
 const uint8_t kMaxLayerLevel                        = 100;
 
+// Layer pitch is a pitch code (Pitch.h): semitones -24..+24, or the old linear scale for layers
+// loaded from older files.
 const uint8_t kMinLayerPitch                        = 0;
-const uint8_t kMaxLayerPitch                        = 150;
+const uint8_t kMaxLayerPitch                        = kPitchCodeMax;
 
 const uint8_t kMinLayerDirection                    = 0;
 const uint8_t kMaxLayerDirection                    = 3;
@@ -6110,10 +6275,13 @@ const uint8_t kMinLayerProbability                  = 0;
 const uint8_t kMaxLayerProbability                  = 100;
 
 const uint8_t kMinLayerFillType                     = 0;
-const uint8_t kMaxLayerFillType                     = 6;
+const uint8_t kMaxLayerFillType                     = 14;  // Must equal kMaxFillType (checked below)
 
 const uint8_t kMinLayerPatternType                  = 0;
 const uint8_t kMaxLayerPatternType                  = 7;
+
+const uint8_t kMinLayerOut                          = NODE_EQ;
+const uint8_t kMaxLayerOut                          = NODE_MASTER;
 
 const uint8_t kMinLayerEq                           = 0;
 const uint8_t kMaxLayerEq                           = 1;
@@ -6131,7 +6299,7 @@ const uint8_t kMinSongBank                          = 0;
 const uint8_t kMaxSongBank                          = 4;
 
 const uint8_t kInitialLayerLevel                    = 75;
-const uint8_t kInitialLayerPitch                    = 50;
+const uint8_t kInitialLayerPitch                    = kPitchDefaultCode;  // 0 semitones
 const uint8_t kInitialLayerDirection                = 0;
 const uint8_t kInitialLayerResolution               = 20;
 const uint8_t kInitialLayerStart                    = 0;
@@ -6150,9 +6318,6 @@ const uint8_t kInitialLayerLfo                      = 0;
 
 const uint8_t kLayerLibrarySize                     = 10;
 const uint8_t kBankLibrarySize                      = 5;
-const uint16_t kBeatLibrarySize                     = 64;
-const uint16_t kBeatFillLibrarySize                 = 32;
-const uint16_t kBeatMicroLibrarySize                = 16 + 1;
 
 const uint8_t kInitialSongBank                      = 0;
 
@@ -6245,44 +6410,6 @@ const uint8_t kLayerDirectionProbability[][5] = {
     {1, 2, 3, 0, 1}};
 
 
-struct LayerEqData {
-    char nameLongR[11];
-    bool data;
-};
-
-const struct LayerEqData kLayerEqDataLibrary[] = {
-    {"       OFF", false},
-    {"        ON", true}};
-
-struct LayerFilterData {
-    char nameLongR[11];
-    bool data[2];
-};
-
-const struct LayerFilterData kLayerFilterDataLibrary[] = {
-    {"       OFF", {false, false}},
-    {"        02", {false, true}},
-    {"     01+02", {true, true}}};
-
-struct LayerEffectData {
-    char nameLongR[11];
-    bool data[2];
-};
-
-const struct LayerEffectData kLayerEffectDataLibrary[] = {
-    {"       OFF", {false, false}},
-    {"        02", {false, true}},
-    {"     01+02", {true, true}}};
-
-struct LayerReverbData {
-    char nameLongR[11];
-    bool data;
-};
-
-const struct LayerReverbData kLayerReverbDataLibrary[] = {
-    {"       OFF", false},
-    {"        ON", true}};
-
 const float kLayerVolumeCoef                        = 0.80;
 
 /*----------------------------------------------------------------------------*/
@@ -6356,7 +6483,7 @@ const struct FrequencyData kFrequencyDataLibrary[] = {
 
 struct InstData {
     char num[4 + 1]                                 = "----";
-    char fileName[kFileNameSize + 17]               = "";  // System/Data/InstName.ins (12 + name + 4 + NUL)
+    char fileName[kFileNameSize + 17]               = "";  // System/Data/InstName.ins (12 + 32 + 4 + nul)
     char folderName[kFileNameSize + 10]             = "";
     char nameLong[kFileNameSize + 1]                = "";
     char nameShortL[12 + 1]                         = "------------";
@@ -6430,7 +6557,7 @@ static uint8_t gLayerInstGraphPrevEndIdx[kLayerLibrarySize] = {0};
 static uint8_t gLayerInstGraphPrevBitDepth[kLayerLibrarySize] = {0xFF};
 static char gLayerInstGraphPrevTimeText[kLayerLibrarySize][8] = {{0}};
 
-static void resetLayerInstGraphCache(uint8_t layerNum_) {
+static inline void resetLayerInstGraphCache(uint8_t layerNum_) {
     if (layerNum_ >= kLayerLibrarySize) return;
 
     gLayerInstGraphCacheInit[layerNum_] = false;
@@ -6447,675 +6574,9 @@ static void resetLayerInstGraphCache(uint8_t layerNum_) {
 
 /*----------------------------------------------------------------------------*/
 
-const uint8_t kFillTimeLibrarySize                  = 3;
-const uint8_t kFillLevelLibrarySize                 = 6;
+#include "Fill.h"
 
-const uint8_t kMinFillType                          = 0;
-const uint8_t kMaxFillType                          = 6;
-
-const uint8_t kMinFillPattern                       = 0;
-const uint8_t kMaxFillPattern                       = 7;
-
-const uint8_t kMinFillTime                          = 0;
-const uint8_t kMaxFillTime                          = 2;
-
-const uint8_t kMinFillLevel                         = 0;
-const uint8_t kMaxFillLevel                         = 4;
-
-struct FillCopyData {
-    bool active                                     = false;
-    int8_t type;
-    int8_t pattern;
-    int8_t time;
-    int8_t level;
-};
-
-struct FillTypeData {
-    char nameLong[11];
-};
-
-const struct FillTypeData kFillTypeDataLibrary[7] = {
-    {"     BASIC"},
-    {"      WAVE"},
-    {"    TRAP-A"},
-    {"    TRAP-B"},
-    {"    TRAP-C"},
-    {"    TRAP-D"},
-    {"     SWING"}};
-
-struct FillPatternData {
-    char nameLong[11];
-    uint8_t stepSize;
-    uint8_t stepMid;
-    uint8_t levelLo;
-    uint8_t levelHi;
-    static const uint8_t levelStep                  = 75;
-    float timeLibrary[kBeatMicroLibrarySize];
-};
-
-const struct FillPatternData kFillPatternDataLibrary[7][8] = {
-    // BASIC
-    {
-     // 10000000
-     {"      FLAT", 1, 1, 100, 100, {0.000000}},
-     // 10000000
-     {"     GHOST", 1, 1, 100, 100, {0.000000}},
-     // 10000000
-     {"     MUTED", 1, 1, 100, 100, {0.000000}},
-     // 10001000
-     {"   BASIC_2", 2, 1, 40, 100, {0.000000, 0.500000, 1.000000}},
-     // 1000 1000 1000
-     {"   BASIC_3", 3, 1, 40, 100, {0.000000, 0.333333, 0.666666, 1.000000}},
-     // 10001000 10001000
-     {"   BASIC_4", 4, 2, 40, 100, {0.000000, 0.250000, 0.500000, 0.750000, 1.000000}},
-     // 1010 1010 1010
-     {"   BASIC_6", 6, 3, 40, 100, {0.000000, 0.166666, 0.333333, 0.500000, 0.666666, 0.833333, 1.000000}},
-     // 10101010 10101010
-     {"   BASIC_8", 8, 4, 40, 100, {0.000000, 0.125000, 0.250000, 0.375000, 0.500000, 0.625000, 0.750000, 0.875000, 1.000000}}},
-        
-     // WAVE
-    {
-     // 11111111 10101010
-     {"    WAVE_A", 12, 8, 40, 100, {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.625000, 0.750000, 0.875000, 1.000000}},
-     // 10101010 11111111
-     {"    WAVE_B", 12, 4, 40, 100, {0.000000, 0.125000, 0.250000, 0.375000, 0.500000, 0.562500, 0.625000, 0.687500, 0.750000, 0.812500, 0.875000, 0.937500, 1.000000}},
-     // 111111 101010
-     {"    WAVE_C", 9, 6, 40, 100, {0.000000, 0.083333, 0.166666, 0.250000, 0.333333, 0.416666, 0.500000, 0.666666, 0.833333, 1.000000}},
-     // 101010 111111
-     {"    WAVE_D", 9, 3, 40, 100, {0.000000, 0.166666, 0.333333, 0.500000, 0.583333, 0.666666, 0.750000, 0.833333, 0.916666, 1.000000}},
-     // 11111111 101010
-     {"    WAVE_E", 11, 8, 40, 100, {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.666666, 0.833333, 1.000000}},
-     // 10101010 111111
-     {"    WAVE_F", 10, 4, 40, 100, {0.000000, 0.125000, 0.250000, 0.375000, 0.500000, 0.583333, 0.666666, 0.750000, 0.833333, 0.916666, 1.000000}},
-     // 111111 10101010
-     {"    WAVE_G", 10, 6, 40, 100, {0.000000, 0.083333, 0.166666, 0.250000, 0.333333, 0.416666, 0.500000, 0.625000, 0.750000, 0.875000, 1.000000}},
-     // 101010 11111111
-     {"    WAVE_H", 11, 3, 40, 100, {0.000000, 0.166666, 0.333333, 0.500000, 0.562500, 0.625000, 0.687500, 0.750000, 0.812500, 0.875000, 0.937500, 1.000000}}},
-    
-     // TRAP-A
-    {
-     // 00000000 00000000
-     {"   TRAP_A1", 5, 2, 40, 100, {0.000000, 0.250000, 0.500000, 0.625000, 0.750000, 1.000000}},
-     // 10101000 10001000
-     {"   TRAP_A2", 5, 3, 40, 100, {0.000000, 0.125000, 0.250000, 0.500000, 0.750000, 1.000000}},
-     // 11111000 10001000
-     {"   TRAP_A3", 7, 5, 40, 100, {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.500000, 0.750000, 1.000000}},
-     // 10001111 10001000
-     {"   TRAP_A4", 7, 5, 40, 100, {0.000000, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.750000, 1.000000}},
-     // 10001110 10001010
-     {"   TRAP_A5", 7, 4, 40, 100, {0.000000, 0.250000, 0.312500, 0.375000, 0.500000, 0.750000, 0.875000, 1.000000}},
-     // 10001000 11111000
-     {"   TRAP_A6", 7, 2, 40, 100, {0.000000, 0.250000, 0.500000, 0.562500, 0.625000, 0.687500, 0.750000, 1.000000}},
-     // 11111000 101010
-     {"   TRAP_A7", 8, 5, 40, 100, {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.500000, 0.666666, 0.833333, 1.000000}},
-     // 11111000 100111
-     {"   TRAP_A8", 9, 5, 40, 100, {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.500000, 0.750000, 0.833333, 0.916666, 1.000000}}},
-
-     // TRAP-B
-    {   
-     // 10001111 10001010
-     {"   TRAP_B1", 8, 5, 40, 100, {0.000000, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.750000, 0.875000, 1.000000}},
-     // 10001000 11111010
-     {"   TRAP_B2", 8, 2, 40, 100, {0.000000, 0.250000, 0.500000, 0.562500, 0.625000, 0.687500, 0.750000, 0.875000, 1.000000}},
-     // 10001000 10001111
-     {"   TRAP_B3", 7, 2, 40, 100, {0.000000, 0.250000, 0.500000, 0.750000, 0.812500, 0.875000, 0.937500, 1.000000}},
-     // 10001111 10101010
-     {"   TRAP_B4", 9, 5, 40, 100, {0.000000, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.625000, 0.750000, 0.875000, 1.000000}},
-     // 10101111 10101010
-     {"   TRAP_B5", 10, 6, 40, 100, {0.000000, 0.125000, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.625000, 0.750000, 0.875000, 1.000000}},
-     // 221110 101010
-     {"   TRAP_B6", 10, 7, 40, 100, {0.000000, 0.041666, 0.083333, 0.125000, 0.166666, 0.250000, 0.333333, 0.500000, 0.666666, 0.833333, 1.000000}},
-     // 101010 221110
-     {"   TRAP_B7", 10, 3, 40, 100, {0.000000, 0.166667, 0.333333, 0.500000, 0.541666, 0.583333, 0.625000, 0.666666, 0.750000, 0.833333, 1.000000}},
-     // 11111000 10101111
-     {"   TRAP_B8", 11, 5, 40, 100, {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.500000, 0.625000, 0.750000, 0.812500, 0.875000, 0.937500, 1.000000}}},
-
-     // TRAP-C
-    {
-     // 10001010 11111111
-     {"   TRAP_C1", 11, 3, 40, 100, {0.000000, 0.250000, 0.375000, 0.500000, 0.562500, 0.625000, 0.687500, 0.750000, 0.812500, 0.875000, 0.937500, 1.000000}},
-     // 11111010 10101111
-     {"   TRAP_C2", 12, 6, 40, 100, {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.375000, 0.500000, 0.625000, 0.750000, 0.812500, 0.875000, 0.937500, 1.000000}},
-     // 11101110 10101110
-     {"   TRAP_C3", 11, 6, 40, 100, {0.000000, 0.062500, 0.125000, 0.250000, 0.312500, 0.375000, 0.500000, 0.625000, 0.750000, 0.812500, 0.875000, 1.000000}},
-     // 22221000 101010
-     {"   TRAP_C4", 12, 9, 40, 100, {0.000000, 0.031250, 0.062500, 0.093750, 0.125000, 0.156250, 0.187500, 0.218750, 0.250000, 0.500000, 0.666666, 0.833333, 1.000000}},
-     // 101010 22221110
-     {"   TRAP_C5", 14, 3, 40, 100, {0.000000, 0.166666, 0.333333, 0.500000, 0.531250, 0.562500, 0.593750, 0.625000, 0.656250, 0.687500, 0.718750, 0.750000, 0.812500, 0.875000, 1.000000}},
-     // 11111000 10001111
-     {"   TRAP_C6", 10, 5, 40, 100, {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.500000, 0.750000, 0.812500, 0.875000, 0.937500, 1.000000}},
-     // 10101111 11101010
-     {"   TRAP_C7", 11, 6, 40, 100, {0.000000, 0.125000, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.562500, 0.625000, 0.750000, 0.875000, 1.000000}},
-     // 22221010 10001010
-     {"   TRAP_C8", 13, 10, 40, 100, {0.000000, 0.031250, 0.062500, 0.093750, 0.125000, 0.156250, 0.187500, 0.218750, 0.250000, 0.375000, 0.500000, 0.750000, 0.875000, 1.000000}}},
-
-     // TRAP-D
-    {
-     // 10102222 10101000
-     {"   TRAP_D1", 13, 10, 40, 100, {0.000000, 0.125000, 0.250000, 0.281250, 0.312500, 0.343750, 0.375000, 0.406250, 0.437500, 0.468750, 0.500000, 0.625000, 0.750000, 1.000000}},
-     // 10111022 10101110
-     {"   TRAP_D2", 13, 8, 40, 100, {0.000000, 0.125000, 0.187500, 0.250000, 0.375000, 0.406250, 0.437500, 0.468750, 0.500000, 0.625000, 0.750000, 0.812500, 0.875000, 1.000000}},
-     // 10101110 10102222
-     {"   TRAP_D3", 15, 5, 40, 100, {0.000000, 0.125000, 0.250000, 0.312500, 0.375000, 0.500000, 0.625000, 0.750000, 0.781250, 0.812500, 0.843750, 0.875000, 0.906250, 0.937500, 0.968750, 1.000000}},
-     // 22221010 11111010
-     {"   TRAP_D4", 16, 10, 40, 100, {0.000000, 0.031250, 0.062500, 0.093750, 0.125000, 0.156250, 0.187500, 0.218750, 0.250000, 0.375000, 0.500000, 0.562500, 0.625000, 0.687500, 0.750000, 0.875000, 1.000000}},
-     // 10102210 22101110
-     {"   TRAP_D5", 15, 7, 40, 100, {0.000000, 0.125000, 0.250000, 0.281250, 0.312500, 0.343750, 0.375000, 0.500000, 0.531250, 0.562500, 0.593750, 0.625000, 0.750000, 0.812500, 0.875000, 1.000000}},
-     // 10102222 20101010
-     {"   TRAP_D6", 15, 10, 40, 100, {0.000000, 0.125000, 0.250000, 0.281250, 0.312500, 0.343750, 0.375000, 0.406250, 0.437500, 0.468750, 0.500000, 0.531250, 0.625000, 0.750000, 0.875000, 1.000000}},
-     // 22221111 10101010
-     {"   TRAP_D7", 16, 12, 40, 100, {0.000000, 0.031250, 0.062500, 0.093750, 0.125000, 0.156250, 0.187500, 0.218750, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.625000, 0.750000, 0.875000, 1.000000}},
-     // 22221010 11101010
-     {"   TRAP_D8", 15, 10, 40, 100, {0.000000, 0.031250, 0.062500, 0.093750, 0.125000, 0.156250, 0.187500, 0.218750, 0.250000, 0.375000, 0.500000, 0.562500, 0.625000, 0.750000, 0.875000, 1.000000}}},
-    
-    // SWING
-    {
-     // swing A
-     {"   SWING_A", 3, 1, 40, 100, {0.000000, 0.500000, 0.875000, 1.000000}},
-     // swing B   
-     {"   SWING_B", 4, 2, 40, 100, {0.000000, 0.250000, 0.500000, 0.875000, 1.000000}},
-     // swing C
-     {"   SWING_C", 7, 5, 40, 100, {0.000000, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.875000, 1.000000}},
-     // swing D
-     {"   SWING_D", 5, 3, 40, 100, {0.000000, 0.166666, 0.333333, 0.500000, 0.875000, 1.000000}},
-     // swing E
-     {"   SWING_E", 6, 4, 40, 100, {0.000000, 0.125000, 0.250000, 0.375000, 0.500000, 0.875000, 1.000000}},
-     // swing F   
-     {"   SWING_F", 4, 2, 40, 100, {0.000000, 0.375000, 0.500000, 0.875000, 1.000000}},
-     // swing G
-     {"   SWING_G", 4, 2, 40, 100, {0.000000, 0.062500, 0.125000, 0.875000, 1.000000}},
-     // swing H
-     {"   SWING_H", 5, 2, 40, 100, {0.000000, 0.333333, 0.666666, 0.750000, 0.875000, 1.000000}}}};
-
-/*
-1/6     {0.000000, 0.166667, 0.333333, 0.500000, 0.666666, 0.833333}
-1/12    {0.000000, 0.083333, 0.166666, 0.250000, 0.333333, 0.416666, 0.500000, 0.583333, 0.666666, 0.750000, 0.833333, 0.916666}
-1/24    {0.000000, 0.041666, 0.083333, 0.125000, 0.166666, 0.208333, 0.250000, 0.291666, 0.333333, 0.375000, 0.416666, 0.458333, 0.500000, 0.541666, 0.583333, 0.625000, 0.666666, 0.708333, 0.750000, 0.791666, 0.833333, 0.875000, 0.916666, 0.958333}
-
-1/8     {0.000000, 0.125000, 0.250000, 0.375000, 0.500000, 0.625000, 0.750000, 0.875000}
-1/16    {0.000000, 0.062500, 0.125000, 0.187500, 0.250000, 0.312500, 0.375000, 0.437500, 0.500000, 0.562500, 0.625000, 0.687500, 0.750000, 0.812500, 0.875000, 0.937500}
-1/32    {0.000000, 0.031250, 0.062500, 0.093750, 0.125000, 0.156250, 0.187500, 0.218750, 0.250000, 0.281250, 0.312500, 0.343750, 0.375000, 0.406250, 0.437500, 0.468750, 0.5000000, 0.531250, 0.562500, 0.593750, 0.625000, 0.656250, 0.687500, 0.718750, 0.750000, 0.781250, 0.812500, 0.843750, 0.875000, 0.906250, 0.937500, 0.968750}
-*/
-
-struct FillTimeData {
-    char nameLongR[11];
-};
-
-const struct FillTimeData kFillTimeDataLibrary[] = {
-    {"       STD"},
-    {"      LEFT"},
-    {"     RIGHT"}};
-
-struct FillLevelData {
-    char nameLongR[11];
-};
-
-const struct FillLevelData kFillLevelDataLibrary[] = {
-    {"      FLAT"},
-    {"      STEP"},
-    {"   DESCEND"},
-    {"    ASCEND"},
-    {"    RANDOM"}};
-
-/*----------------------------------------------------------------------------*/
-
-#define NULL_FILL_TARGET                            255
-
-struct BeatMicro {
-    // [7]      : active
-    // [6:0]    : level
-
-    uint8_t data                                    = 0x00;
-    uint16_t interval                               = 0x00;
-
-    void set(uint16_t interval_, uint8_t level_) {
-        setActive(true);
-        setLevel(level_);
-        interval = interval_;
-    }
-
-    void reset() {
-        data = 0x00;
-        interval = 0x00;
-    }
-
-    void setActive(bool active) {
-        data &= 0x7F;                               // Clear bit 7
-        data |= (active << 7);                      // Write bit 7
-    }
-
-    bool getActive() const { return (data >> 7); }
-
-    void setLevel(uint8_t level_) {
-        data &= 0x80;                               // Keep only bit 7
-        data |= (level_ & 0x7F);                    // Write lower 7 bits
-    }
-
-    uint8_t getLevel() const { return (data & 0x7F); }
-
-    void setInterval(uint16_t interval_) { interval = interval_; }
-
-    uint16_t getInterval() const { return interval; }
-};
-
-/*----------------------------------------------------------------------------*/
-
-#define FILL_TIME_STD                               0x00
-#define FILL_TIME_L_ALIGNED                         0x01
-#define FILL_TIME_R_ALIGNED                         0x02
-
-struct BeatFill {
-    // [7]   : active
-    // [6:0] : stepSize
-
-    uint8_t data                                    = 0x00;
-    static constexpr uint8_t ACTIVE_MASK            = 0x80;
-    static constexpr uint8_t STEPSIZE_MASK          = 0x7F;
-
-    BeatMicro beatMicroLibrary[kBeatMicroLibrarySize];
-
-    void setActive(bool active_) { (active_) ? data |= ACTIVE_MASK : data &= static_cast<uint8_t>(~ACTIVE_MASK); }
-
-    bool getActive() const { return (data & ACTIVE_MASK) != 0; }
-
-    void setStepSize(uint8_t stepSize_) {
-        data &= ACTIVE_MASK;
-        data |= (stepSize_ & STEPSIZE_MASK);
-    }
-
-    uint8_t getStepSize() const { return data & STEPSIZE_MASK; }
-
-    void set(uint16_t startInterval_, uint16_t endInterval_, uint8_t fillType_, uint8_t fillPattern_, uint8_t fillTime_, uint8_t fillLevel_) {
-        setActive(true);
-
-        // Reset beat micro library
-        for (uint8_t i = 0; i < kBeatMicroLibrarySize; i++) {
-            beatMicroLibrary[i].reset();
-        }
-
-        // Set beat micro library
-        const FillPatternData& refFill = kFillPatternDataLibrary[fillType_][fillPattern_];
-        uint16_t totalInterval = static_cast<uint16_t>(endInterval_ - startInterval_);
-
-        uint8_t stepSize;
-        uint8_t stepMid = refFill.stepMid;
-        uint16_t interval;
-        uint8_t level;
-        float levelInc;
-        float levelDec;
-        int levelHigh = refFill.levelHi;
-        int levelLow = refFill.levelLo;
-        int levelStep = refFill.levelStep;
-        float levelDiff = levelHigh - levelLow;
-        uint8_t levelLibrary[refFill.stepSize + 1];
-        uint8_t i;
-
-        switch (fillTime_) {
-            case FILL_TIME_STD:
-                stepSize = refFill.stepSize;
-                setStepSize(stepSize);
-                switch (fillLevel_) {
-                    case 0:  // Flat
-                        for (i = 0; i < stepSize; i++) levelLibrary[i] = levelHigh;
-                        break;
-
-                    case 1:  // Step
-                        for (i = 0; i < stepSize; i++) {
-                            (i % 2) ? levelLibrary[i] = levelStep : levelLibrary[i] = levelHigh;
-                        }
-                        break;
-
-                    case 2:  // Hi-Lo
-                        levelDec = levelDiff / (stepSize - 1);
-                        for (i = 0; i < stepSize; i++) {
-                            levelLibrary[i] = clamp((int)(levelHigh - (levelDec * i)), levelLow, levelHigh);
-                        }
-                        break;
-
-                    case 3:  // Lo-Hi
-                        levelInc = levelDiff / (stepSize - 1);
-                        for (i = 0; i < stepSize; i++) {
-                            levelLibrary[i] = clamp((int)(levelLow + (levelInc * i)), levelLow, levelHigh);
-                        }
-                        break;
-
-                    case 4:  // Random
-                        for (i = 0; i < stepSize; i++) {
-                            levelLibrary[i] = clamp((int)(levelLow + (rand() % (uint8_t)levelDiff)), levelLow, levelHigh);
-                            ;
-                        }
-                        break;
-                }
-
-                for (i = 0; i < getStepSize(); i++) {
-                    interval = static_cast<uint16_t>(startInterval_ + static_cast<uint16_t>(totalInterval * refFill.timeLibrary[i]));
-                    level = levelLibrary[i];
-                    beatMicroLibrary[i].set(interval, level);
-                }
-                break;
-
-            case FILL_TIME_L_ALIGNED:
-                stepSize = refFill.stepSize + 1;
-                setStepSize(stepSize);
-                switch (fillLevel_) {
-                    case 0:  // Flat
-                        for (i = 0; i < stepSize; i++) levelLibrary[i] = levelHigh;
-                        break;
-
-                    case 1:  // Step
-                        for (i = 0; i < stepSize; i++) {
-                            (i % 2) ? levelLibrary[i] = levelStep : levelLibrary[i] = levelHigh;
-                        }
-                        break;
-
-                    case 2:  // Hi-Lo
-                        levelDec = (float)levelDiff / (stepSize - 1);
-                        for (i = 0; i < stepSize; i++) {
-                            levelLibrary[i] = clamp((int)(levelHigh - (levelDec * i)), levelLow, levelHigh);
-                        }
-                        break;
-
-                    case 3:  // Lo-Hi
-                        levelInc = (float)levelDiff / (stepSize - 1);
-                        for (i = 0; i < stepSize; i++) {
-                            levelLibrary[i] = clamp((int)(levelLow + (levelInc * i)), levelLow, levelHigh);
-                        }
-                        break;
-
-                    case 4:  // Random
-                        for (i = 0; i < stepSize; i++) {
-                            levelLibrary[i] = clamp((int)(levelLow + (rand() % (uint8_t)levelDiff)), levelLow, levelHigh);
-                            ;
-                        }
-                        break;
-                }
-
-                for (i = 0; i < getStepSize(); i++) {
-                    interval = static_cast<uint16_t>(startInterval_ + static_cast<uint16_t>(totalInterval * refFill.timeLibrary[i] * 0.5));
-                    level = levelLibrary[i];
-                    beatMicroLibrary[i].set(interval, level);
-                }
-                break;
-
-            case FILL_TIME_R_ALIGNED:
-                stepSize = refFill.stepSize + 1;
-                setStepSize(stepSize);
-                switch (fillLevel_) {
-                    case 0:  // Flat
-                        for (i = 0; i < stepSize; i++) levelLibrary[i] = levelHigh;
-                        break;
-
-                    case 1:  // Step
-                        levelLibrary[0] = levelHigh;
-                        for (i = 0; i < (stepSize - 1); i++) {
-                            (i % 2) ? levelLibrary[i + 1] = levelStep : levelLibrary[i + 1] = levelHigh;
-                        }
-                        break;
-
-                    case 2:  // Hi-Lo
-                        stepSize -= 1;
-                        levelDec = (float)levelDiff / (stepSize - 1);
-                        levelLibrary[0] = levelHigh;
-                        for (i = 0; i < stepSize; i++) {
-                            levelLibrary[i + 1] = clamp((int)(levelHigh - (levelDec * i)), levelLow, levelHigh);
-                        }
-                        break;
-
-                    case 3:  // Lo-Hi
-                        stepSize -= 1;
-                        levelInc = (float)levelDiff / (stepSize - 1);
-                        levelLibrary[0] = levelHigh;
-                        for (i = 0; i < stepSize; i++) {
-                            levelLibrary[i + 1] = clamp((int)(levelLow + (levelInc * i)), levelLow, levelHigh);
-                        }
-                        break;
-
-                    case 4:  // Random
-                        levelLibrary[0] = levelHigh;
-                        for (i = 1; i < stepSize; i++) {
-                            levelLibrary[i] = clamp((int)(levelLow + (rand() % (uint8_t)levelDiff)), levelLow, levelHigh);
-                            ;
-                        }
-                        break;
-                }
-
-                for (i = 0; i < getStepSize(); i++) {
-                    (i == 0) ? interval = startInterval_ : interval = static_cast<uint16_t>(startInterval_ + static_cast<uint16_t>(totalInterval * ((refFill.timeLibrary[i - 1] * 0.5) + 0.5f)));
-                    level = levelLibrary[i];
-                    beatMicroLibrary[i].set(interval, level);
-                }
-                break;
-        }
-    }
-
-    void reset() {
-        setActive(false);
-        setStepSize(0);
-        for (uint8_t i = 0; i < kBeatMicroLibrarySize; i++) {
-            beatMicroLibrary[i].reset();
-        }
-    }
-};
-
-/*----------------------------------------------------------------------------*/
-
-struct Beat {
-    // [15]     : active
-    // [14:11]  : fillType
-    // [10:8]   : fillPattern
-    // [7:4]    : fillTime
-    // [3:0]    : fillLevel
-
-    uint16_t data                                   = 0x0000;
-    uint8_t fillTarget                              = NULL_FILL_TARGET;
-    uint16_t startInterval                          = 0;
-    uint16_t endInterval                            = 0;
-
-    // Bit masks for precise field extraction
-
-    static constexpr uint16_t ACTIVE_MASK           = 0x8000;
-    static constexpr uint16_t TYPE_MASK             = 0x7800;                   // Bits 14:11
-    static constexpr uint16_t PATTERN_MASK          = 0x0700;                   // Bits 10:8
-    static constexpr uint16_t TIME_MASK             = 0x00F0;                   // Bits 7:4
-    static constexpr uint16_t LEVEL_MASK            = 0x000F;                   // Bits 3:0
-
-    // Bit shifts for fast field alignment
-
-    static constexpr unsigned TYPE_SHIFT            = 11;
-    static constexpr unsigned PATTERN_SHIFT         = 8;
-    static constexpr unsigned TIME_SHIFT            = 4;
-    static constexpr unsigned LEVEL_SHIFT           = 0;
-
-    void reset() noexcept {
-        data = 0x0000;
-        startInterval = 0;
-        endInterval = 0;
-        fillTarget = NULL_FILL_TARGET;
-    }
-
-    // Active bit logic
-    void setActive(bool active) noexcept {
-        data = active ? (data | ACTIVE_MASK) : (data & ~ACTIVE_MASK);
-    }
-
-    bool getActive() const noexcept { return (data & ACTIVE_MASK) != 0; }
-
-    // Fill group logic (0-15)
-    void setFillType(uint8_t type_) noexcept {
-        data = (data & ~TYPE_MASK) | (static_cast<uint16_t>(type_ & 0x0F) << TYPE_SHIFT);
-    }
-
-    uint8_t getFillType() const noexcept { return static_cast<uint8_t>((data & TYPE_MASK) >> TYPE_SHIFT); }
-
-    // Pattern variation logic (0-7)
-    void setFillPattern(uint8_t pattern_) noexcept {
-        data = (data & ~PATTERN_MASK) | (static_cast<uint16_t>(pattern_ & 0x07) << PATTERN_SHIFT);
-    }
-
-    uint8_t getFillPattern() const noexcept { return static_cast<uint8_t>((data & PATTERN_MASK) >> PATTERN_SHIFT); }
-
-    // Timing mode logic (0-15)
-    void setFillTime(uint8_t mode_) noexcept {
-        data = (data & ~TIME_MASK) | (static_cast<uint16_t>(mode_ & 0x0F) << TIME_SHIFT);
-    }
-
-    uint8_t getFillTime() const noexcept { return static_cast<uint8_t>((data & TIME_MASK) >> TIME_SHIFT); }
-
-    // Level/velocity logic (0-15)
-    void setFillLevel(uint8_t mode_) noexcept {
-        data = (data & ~LEVEL_MASK) | (static_cast<uint16_t>(mode_ & 0x0F) << LEVEL_SHIFT);
-    }
-
-    uint8_t getFillLevel() const noexcept { return static_cast<uint8_t>(data & LEVEL_MASK); }
-
-    // Utility getters and setters
-    void setFillTarget(uint8_t target_) noexcept { fillTarget = target_; }
-
-    uint8_t getFillTarget() const noexcept { return fillTarget; }
-
-    void setStartInterval(uint16_t interval_) noexcept { startInterval = interval_; }
-
-    uint16_t getStartInterval() const noexcept { return startInterval; }
-
-    void setEndInterval(uint16_t interval_) noexcept { endInterval = interval_; }
-
-    uint16_t getEndInterval() const noexcept { return endInterval; }
-
-    uint16_t getData() const noexcept { return data; }
-};
-
-/*----------------------------------------------------------------------------*/
-
-struct Bank {
-    Beat beatLibrary[kBeatLibrarySize];
-    BeatFill beatFillLibrary[kBeatFillLibrarySize];
-
-    int8_t lastActiveBeatNum                        = -1;
-    int8_t playBeatNum                              = -1;
-    int8_t playBeatMicroNum                         = -1;
-
-    int16_t ownerOfFillTarget(uint8_t fillIdx) const {
-        for (uint8_t i = 0; i < kBeatLibrarySize; i++) {
-            if (beatLibrary[i].getActive() && beatLibrary[i].getFillTarget() == fillIdx) {
-                return static_cast<int16_t>(i);
-            }
-        }
-        return -1;
-    }
-
-    uint8_t findFreeFillSlot() const {
-        for (uint8_t i = 0; i < kBeatFillLibrarySize; i++) {
-            if (!beatFillLibrary[i].getActive() && ownerOfFillTarget(i) == -1) {
-                return i;
-            }
-        }
-        return NULL_FILL_TARGET;
-    }
-
-    void setBeat(uint8_t beatNum_, uint16_t startInterval_, uint16_t endInterval_) {
-        Beat& beat = beatLibrary[beatNum_];
-        beat.setActive(true);
-        beat.setStartInterval(startInterval_);
-        beat.setEndInterval(endInterval_);
-        beat.setFillType(0);
-
-        uint8_t oldTarget = beat.getFillTarget();
-        if (oldTarget != NULL_FILL_TARGET) {
-            if (ownerOfFillTarget(oldTarget) == beatNum_) {
-                beatFillLibrary[oldTarget].reset();
-            }
-        }
-
-        beat.setFillTarget(NULL_FILL_TARGET);
-        beat.setFillTime(0);
-        beat.setFillLevel(0);
-    }
-
-    void resetBeat(uint8_t beatNum_) {
-        Beat& beat = beatLibrary[beatNum_];
-        uint8_t oldTarget = beat.getFillTarget();
-
-        // ownerOfFillTarget only matches an active beat. Free the slot first.
-        if (oldTarget != NULL_FILL_TARGET) {
-            if (ownerOfFillTarget(oldTarget) == beatNum_) {
-                beatFillLibrary[oldTarget].reset();
-            }
-        }
-
-        beat.setActive(false);
-        beat.setStartInterval(0);
-        beat.setEndInterval(0);
-        beat.setFillType(0);
-        beat.setFillTarget(NULL_FILL_TARGET);
-        beat.setFillTime(0);
-        beat.setFillLevel(0);
-    }
-
-    uint8_t setBeatFill(uint8_t beatNum_, uint8_t fillType_, uint8_t fillPattern_, uint8_t fillTime_, uint8_t fillLevel_) {
-        Beat& beat = beatLibrary[beatNum_];
-
-        if ((fillType_ == 0) && (fillPattern_ <= 2)) {
-            uint8_t oldTarget = beat.getFillTarget();
-            if (oldTarget != NULL_FILL_TARGET) {
-                if (ownerOfFillTarget(oldTarget) == beatNum_) {
-                    beatFillLibrary[oldTarget].reset();
-                }
-            }
-
-            beat.setFillType(fillType_);
-            beat.setFillPattern(fillPattern_);
-            beat.setFillTarget(NULL_FILL_TARGET);
-            beat.setFillTime(fillTime_);
-            beat.setFillLevel(fillLevel_);
-            return NULL_FILL_TARGET;
-        }
-
-        // Complex fill: ensure a beatFill slot exists
-        uint8_t fillTarget_ = beat.getFillTarget();
-
-        if (fillTarget_ == NULL_FILL_TARGET) {
-            fillTarget_ = findFreeFillSlot();
-        }
-
-        if (fillTarget_ == NULL_FILL_TARGET) {
-            // No free slot -> fall back to basic state
-            beat.setFillType(0);
-            beat.setFillPattern(0);
-            beat.setFillTarget(NULL_FILL_TARGET);
-            beat.setFillTime(0);
-            beat.setFillLevel(0);
-            return NULL_FILL_TARGET;
-        }
-
-        // Assign state to beat
-        beat.setFillType(fillType_);
-        beat.setFillPattern(fillPattern_);
-        beat.setFillTarget(fillTarget_);
-        beat.setFillTime(fillTime_);
-        beat.setFillLevel(fillLevel_);
-
-        // Initialize/refresh beatFill micro pattern
-        beatFillLibrary[fillTarget_].set(beat.getStartInterval(), beat.getEndInterval(), fillType_, fillPattern_, fillTime_, fillLevel_);
-        return fillTarget_;
-    }
-
-    void resetBeatFill(uint8_t beatNum_) {
-        Beat& beat = beatLibrary[beatNum_];
-        uint8_t tgt = beat.getFillTarget();
-
-        if (tgt != NULL_FILL_TARGET) {
-            if (ownerOfFillTarget(tgt) == beatNum_) {
-                beatFillLibrary[tgt].reset();
-            }
-        }
-
-        beat.setFillType(0);
-        beat.setFillPattern(0);
-        beat.setFillTime(0);
-        beat.setFillLevel(0);
-        beat.setFillTarget(NULL_FILL_TARGET);
-    }
-};
+static_assert(kMaxLayerFillType == kMaxFillType, "UI fill type range must match the fill library");
 
 /*----------------------------------------------------------------------------*/
 
@@ -7279,6 +6740,7 @@ struct LfoPlayData {
 struct BeatPlayData {
     bool active;
     uint32_t ramAddress;
+    uint32_t stereoOffset;                          // bytes from the left plane to the right one; 0 = a mono sample
 
     float volumeMultiplier;
     uint32_t resolutionCoef;
@@ -7313,6 +6775,18 @@ struct LayerPlayData {
     bool tempBeatTimingFlag;
     uint16_t tempBeatTimingCounter;
     uint16_t tempBeatTimingCounterMax;
+
+    // What the last hit actually used (after LFO modulation), for the instrument page. Written
+    // by layer_playBeat(), indexed by LayerShown; shownValid has a bit per value set since play
+    // started.
+    volatile int16_t shownValue[8]                  = {};
+    volatile uint8_t shownValid                     = 0;
+    volatile bool shownChanged                      = false;
+};
+
+// Instrument page values that LFOs modulate (LayerPlayData::shownValue index).
+enum LayerShown : uint8_t {
+    SHOWN_LEVEL, SHOWN_PITCH, SHOWN_DIRECTION, SHOWN_RESOLUTION, SHOWN_START, SHOWN_END, SHOWN_TIMING, SHOWN_PROBABILITY
 };
 
 const uint8_t wavIntro[44]                          = {0x52, 0x49, 0x46, 0x46, 0xAC, 0x58, 0x01, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6D, 0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x44, 0xAC, 0x00, 0x00, 0x88, 0x58, 0x01, 0x00, 0x02, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x10, 0xB1, 0x02, 0x00};

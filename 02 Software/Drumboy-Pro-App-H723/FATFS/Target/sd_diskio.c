@@ -59,6 +59,9 @@
  * Notice: This is applicable only for cortex M7 based platform.
  */
 /* USER CODE BEGIN enableSDDmaCacheMaintenance */
+#if defined(ENABLE_DCACHE)
+#define ENABLE_SD_DMA_CACHE_MAINTENANCE  1
+#endif
 /* #define ENABLE_SD_DMA_CACHE_MAINTENANCE  1 */
 /* USER CODE END enableSDDmaCacheMaintenance */
 
@@ -407,6 +410,13 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 
         memcpy((void *)scratch, (void *)buff, BLOCKSIZE);
         buff += BLOCKSIZE;
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+        /*
+        * the copy sits in the data cache (write-back): clean it, or the DMA writes what the RAM held
+        * before (stale sectors into the directory and the FAT, which corrupted the card)
+        */
+        SCB_CleanDCache_by_Addr((uint32_t*)scratch, BLOCKSIZE);
+#endif
 
         ret = BSP_SD_WriteBlocks_DMA((uint32_t*)scratch, (uint32_t)sector++, 1);
         if (ret == MSD_OK) {

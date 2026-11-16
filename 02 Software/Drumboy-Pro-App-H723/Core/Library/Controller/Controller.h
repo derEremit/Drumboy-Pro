@@ -4,6 +4,8 @@
 #include <cctype>
 
 #include "Dac.h"
+#include "BeatList.h"
+#include "Euclid.h"
 #include "Global.h"
 #include "Lcd.h"
 #include "fatfs.h"
@@ -28,7 +30,14 @@ extern __attribute__((section(".RAM_D3"))) uint8_t i2c4_txData[2];
 
 /* Sync And Midi Buffers ----------------------------------------- */
 
-extern "C" uint8_t midiRxData;
+// The byte the MIDI-in DMA writes: alone in its own 32-byte cache line (the data cache build
+// invalidates that line before the byte is read).
+struct MidiRxBox {
+    uint8_t value;
+    uint8_t pad[31];
+} __attribute__((aligned(32)));
+extern "C" MidiRxBox midiRxBox;
+#define midiRxData midiRxBox.value
 
 /* Peripheral Handles -------------------------------------------- */
 
@@ -67,14 +76,14 @@ class Controller {
 
     /* Preset Data Buffers --------------------------------------- */
 
-    char dataSystemPreset[kSystemPresetDataSize];                       // Buffer for global system settings
-    char dataEncoderGlobalPreset[kEncoderGlobalPresetDataSize];         // Shared encoder mappings
-    char dataEncoderLocalPreset[kEncoderLocalPresetDataSize];           // Context-specific encoder values
+    char dataSystemPreset[kSystemPresetDataSize]{0};                    // Buffer for global system settings
+    char dataEncoderGlobalPreset[kEncoderGlobalPresetDataSize]{0};      // Shared encoder mappings
+    char dataEncoderLocalPreset[kEncoderLocalPresetDataSize]{0};        // Context-specific encoder values
 
     /* Libraries & Data Structures ------------------------------- */
 
-    Lfo lfoLibrary[kLfoLibrarySize];                                    // Collection of all LFO configurations
-    Layer layerLibrary[kLayerLibrarySize];                              // Collection of all instrument layers (Drum kits/Synths)
+    Lfo lfoLibrary[kLfoLibrarySize]{{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}};                                    // Collection of all LFO configurations
+    Layer layerLibrary[kLayerLibrarySize]{{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}};                              // Collection of all instrument layers (Drum kits/Synths)
 
     /* Clipboard / Buffered Operations --------------------------- */
 
@@ -93,6 +102,37 @@ class Controller {
 
     volatile uint32_t i2sOvrCount = 0;                                  // I2S3 rx overruns; nonzero means word alignment may have shifted
     volatile uint32_t i2sUdrCount = 0;                                  // I2S3 tx underruns; nonzero means the audio isr missed its deadline
+    RoutePatch routePatch = kDefaultRoutePatch;                         // where each module's output goes (Routing.h)
+    uint8_t metroOut = NODE_REV;                                        // metronome destination (V1.04 default: reverb)
+    RouteState routeState;                                              // module output fades (audio interrupt only)
+    RouteFade lineInFade;                                               // line-in route fade (audio interrupt only)
+    RouteFade metroFade;                                                // metronome route fade (audio interrupt only)
+    // CPU and MEM monitor (LoadMeter.h): the audio engine's load, measured in every build.
+    // Layer meters and the status line (StatusLine.h).
+    volatile float layerPeak[kLayerLibrarySize] = {0};                  // peak since the last readout (audio interrupt)
+    uint16_t meterShown[kLayerLibrarySize] = {0};                       // level on the bar, in pixels
+    uint32_t meterClipUntil[kLayerLibrarySize] = {0};                   // the clip square stays until then
+    uint32_t meterDrawn[kLayerLibrarySize];                             // what the screen shows (pixels, clip), 0xFFFFFFFF = nothing
+    uint32_t meterTick = 0;
+    char statusDrawn[kStatusMaxChars + 1] = "";                         // the text on the status line
+    uint32_t statusTick = 0;
+    uint32_t autosaveLastAt = 0;                                        // when the last autosave was written
+    bool autosaveWritten = false;
+    void lcd_drawLayerMeters();
+    void lcd_drawStatusLine();
+#ifdef DSP_PROFILE
+    // Per-stage audio cost (make PROFILE=1): cycles summed since the last readout. Stages: 0 line-in,
+    // 1 metronome, 2 layers, 3 EQ, 4 Filter 1, 5 Filter 2, 6 Effect 1, 7 Effect 2, 8 reverb,
+    // 9 routing (sources scattered into the nodes), 10 output stage.
+    volatile uint32_t profSum[11] = {0};
+#endif
+    LoadMeter dspLoad;                                                  // filled by processAudioBlock
+    bool monitorFull = true;                                            // draw the labels (first time)
+    uint32_t monitorTick = 0;
+    uint32_t monitorCpuShown = 0;                                       // tenths of a percent on the bar
+    uint32_t monitorCpuMax = 0;                                         // worst block since power-on
+    uint32_t monitorCpuDrawn = 0xFFFFFFFFu;                             // what the screen shows (number, bar, colour)
+    uint32_t monitorMemDrawn = 0xFFFFFFFFu;
 
     /* Audio Buffers (I2s Block Processing) ---------------------- */
 
@@ -100,12 +140,12 @@ class Controller {
     float audioMetronome[I2S_BLOCK_SIZE];                               // Metronome click buffer
     float audioLayer[kLayerLibrarySize][I2S_BLOCK_SIZE];                // Individual layer audio buffers
 
-    float audioEq[I2S_BLOCK_SIZE];                                      // Post-EQ audio buffer
-    float audioFilter[kFilterLibrarySize][I2S_BLOCK_SIZE];              // Post-Filter audio buffers
-    float audioEffect[kEffectLibrarySize][I2S_BLOCK_SIZE];              // Post-Effect audio buffers
-    float audioReverb_L[I2S_BLOCK_SIZE];                                // Reverb Left channel
+    float audioEq[I2S_BLOCK_SIZE];                                      // EQ node: routed input, processed in place
+    float audioFilter[kFilterLibrarySize][I2S_BLOCK_SIZE];              // Filter 1/2 nodes: routed input, processed in place
+    float audioEffect[kEffectLibrarySize][I2S_BLOCK_SIZE];              // FX 1/2 nodes: routed input, processed in place
+    float audioReverb_L[I2S_BLOCK_SIZE];                                // Reverb node: routed input, then left output
     float audioReverb_R[I2S_BLOCK_SIZE];                                // Reverb Right channel
-    float audioSend_L[I2S_BLOCK_SIZE];                                  // Final Master Left buffer
+    float audioSend_L[I2S_BLOCK_SIZE];                                  // Master pair: everything routed to MASTER
     float audioSend_R[I2S_BLOCK_SIZE];                                  // Final Master Right buffer
     float audioPeak_L;                                                  // Peak meter value for Left channel
     float audioPeak_R;                                                  // Peak meter value for Right channel
@@ -138,9 +178,9 @@ class Controller {
 
     /* Sd Card & Filesystem -------------------------------------- */
 
-    bool sdInsertCheck;                                                 // Hardware detection of SD card presence
-    bool loadAction;                                                    // Flag to trigger file loading
-    bool saveAction;                                                    // Flag to trigger file saving
+    bool sdInsertCheck = false;                                         // Hardware detection of SD card presence
+    bool loadAction = false;                                            // Flag to trigger file loading
+    bool saveAction = false;                                            // Flag to trigger file saving
     uint16_t fileLibrarySize;                                           // Total projects found on SD
     uint16_t drumkitLibrarySize;                                        // Total drum kits found on SD
     uint16_t instLibrarySize;                                           // Total instruments found on SD
@@ -175,10 +215,10 @@ class Controller {
     FileStatus fileStatus;                                              // Current operation status of project files
     FileStatus drumkitStatus;                                           // Current operation status of drum kits
 
-    TriggerMode triggerMode;                                            // Quantization setting
+    TriggerMode triggerMode = TRIG_BAR;                                 // Quantization setting
     bool playActive;                                                    // Transport status: Playing
     bool recordActive;                                                  // Transport status: Recording
-    bool precountPendingBeat[kLayerLibrarySize];                        // Layer hits during precount, committed to interval 0 when playback starts
+    uint8_t precountPendingBeat[kLayerLibrarySize];                     // Layer hits during precount (0 none, velocity + 1), committed when playback starts
     bool playArmed;                                                     // Slave mode: waiting for master START to play
     bool recordArmed;                                                   // Slave mode: waiting for master START to record
     bool ignoreNextMidiStopAfterSpecialCmd;
@@ -226,7 +266,7 @@ class Controller {
 
     /* Ui & Notification Flags ----------------------------------- */
 
-    bool textCopyFlag, textPasteFlag, textClearFlag, textArmedFlag;
+    bool textCopyFlag, textPasteFlag, textClearFlag, textArmedFlag, textFullFlag;
     bool limitAlertShowFlag, limitAlertClearFlag, limitAlertActive;
     bool limitLayerFlag[kLayerLibrarySize];
 
@@ -246,6 +286,191 @@ class Controller {
     bool transitionShowEncoder[kEncoderSize], transitionClearEncoder[kEncoderSize];
 
     uint8_t layerBeatKeyStage;                                        
+    bool layerSongAddArmed;  // ADD pressed on Layer Song: a short press inserts a beat
+    bool layerSongAddUsed;   // another key or encoder was used while ADD was held
+    int32_t layerSongShift;  // net SHIFT ALL since the page was opened, in intervals
+    bool layerModKeyUsed;    // a layer pad was pressed while L, I or S was held (so its release is not a tap)
+
+    // EUCLID page (settings kept while powered; the layer's beats from before are in euclidSnapshot)
+    uint8_t euclidSteps = 16;
+    uint8_t euclidHits = 4;
+    uint8_t euclidRotate = 0;
+    uint8_t euclidGrid = kInitialQuantize;  // index into kQuantizeInterval
+    bool euclidMerge = false;
+    uint8_t euclidAccentCount = 0;  // 0 = off (every hit full); else that many accents, the other hits GHOST
+    bool euclidApplied = false;  // the layer holds a pattern; CLEAR restores euclidSnapshot
+    uint16_t euclidDropped = 0;  // hits that did not fit in the bank
+    uint8_t euclidBank = 0;      // song bank euclidSnapshot was taken from
+
+    // Sample preview (Preview.h): the ring and voice are shared with the audio interrupt, which only
+    // renders; the main loop streams the file (preview_update).
+    PreviewRing previewRing{reinterpret_cast<float*>(RAM_PREVIEW_ADDRESS), kPreviewRingSize - 1, 0, 0};
+    PreviewVoice previewVoice{};
+    FIL previewFile;
+    bool previewFileOpen = false;
+    uint32_t previewBytesLeft = 0;
+    PreviewFormat previewFormat{0, 0, 0};
+    bool previewPending = false;        // start once the voice is idle and the knob has rested
+    uint32_t previewRequestTick = 0;
+    int8_t previewLayer = -1;
+    // Autosave (Autosave.h): interval on the Metronome page, CRC of the last safe state.
+    AutosaveTiming autosaveTiming;
+    uint32_t autosaveCleanCrc = 0;
+    bool autosavePending = false;           // due and changed: write when safe
+    uint32_t lastInputMs = 0;               // last key or encoder (autosave waits while editing)
+    volatile bool loopEndFlag = false;      // the sequencer wrapped (set in interruptPlay)
+    const char* fileNameOverride = nullptr; // set: sd_checkFile/sd_loadFile/sd_saveFile use this path
+    void file_encodeKit(uint8_t* data);
+    void file_encodeLayerSong(uint8_t layerNum_, uint8_t* data);
+    uint32_t file_stateCrc();
+    uint16_t file_noteEntryCount();
+    uint32_t file_noteCrc(uint32_t crc_);
+    bool file_writeNotes();
+    void file_readNotes(const char* fileName_);
+    uint16_t layerSong_quantizeInterval(uint16_t interval_) const;
+    // Trig conditions (BeatNote.h): loops of the active bank, each layer's PRE, fills skipped whole.
+    volatile uint16_t noteLoop = 0;
+    bool notePre[kLayerLibrarySize] = {true, true, true, true, true, true, true, true, true, true};
+    bool noteFillSkip[kLayerLibrarySize] = {false};
+    bool note_plays(uint8_t layerNum_, uint16_t note_);
+    void note_restartLoops();
+    void layerPage_bankChanged();
+    // SOLO (left S key + pads, V1.14): soloed layers, not saved.
+    uint16_t soloMask = 0;
+    bool layerAudible(uint8_t layerNum_) const;
+    RGB16Color layerColor(uint8_t layerNum_) const;
+    // Full-area views over the lanes (LaneView.h): EUCLID rings, SONG timeline, ROUTING diagram.
+    Menu laneViewShown = INIT_MENU;         // the page whose view is on screen (INIT_MENU: the lanes are)
+    bool viewDirty = false;                 // something the view shows changed: redraw its data
+    bool viewFull = false;                  // something drew over it (an alert): redraw all of it
+    uint32_t viewDrawnMs = 0;
+    bool ringPlayShown = false;
+    int16_t ringPlayX = 0, ringPlayY = 0;
+    uint16_t ringPlayRowX = 0;
+    uint32_t songThumbDrawn[kChainBanks] = {0};  // what each bank's thumbnail shows (songThumbState), 0 = nothing
+    uint16_t songPlayBarX = 0, songPlayBarW = 0, songPlayShown = 0;  // the playing loop's progress bar
+    bool laneViewHidden() const;
+    void lcd_drawLaneView();
+    void lcd_drawLaneViewData();
+    void lcd_updateLaneView();
+    void lcd_restoreLanes();
+    void lcd_drawEuclidViewData();
+    void lcd_drawEuclidViewPlay();
+    uint32_t songThumbState(uint8_t bank_, uint8_t color_) const;
+    void lcd_drawSongViewData();
+    void lcd_drawSongViewPlay();
+    void lcd_drawRoutingViewData();
+    bool filterViewDrawn = false;           // curves are on screen (and stored in the view scratch)
+    bool filterViewOther = false;           // the other filter's curve is among them
+    uint16_t filterViewMarkX = 0;           // the cutoff line
+    uint32_t filterViewStateDrawn = 0;      // the settings those curves were drawn from
+    uint32_t filterViewState() const;
+    void lcd_drawFilterCurve(const uint16_t* y_, bool thick_);
+    void lcd_drawFilterViewData();
+    uint16_t eqViewMarkX[6] = {0}, eqViewMarkY[6] = {0};  // the EQ view's band handles
+    uint32_t eqViewState() const;
+    void lcd_drawCurveAxes(float topDb_, float bottomDb_, bool labels_);
+    void lcd_drawEqViewData();
+    uint32_t sampleViewKey = 0;             // which sample the peak columns belong to (0 = none)
+    uint32_t sampleViewStateDrawn = 0;      // the settings the view was drawn from
+    uint8_t sampleViewStart = 0, sampleViewEnd = 100;  // the handles as drawn
+    uint32_t sampleViewState() const;
+    void lcd_drawSampleViewData();
+    void lcd_drawSampleColumns(uint16_t from_, uint16_t to_, uint8_t start_, uint8_t end_);
+    void lcd_drawSampleHandles(uint8_t start_, uint8_t end_, bool clear_);
+
+    // DUB mode (DubMix.h)
+    DubMix dubMix;                                          // the strips; on = DUB mode (a song setting)
+    char missingDetail[40] = "";                           // MISSING SAMPLE alert: the first missing layer, instrument and sample ("L3 Kick/Name")
+    void missing_note(uint8_t layer_, const char* inst_, const char* sample_);
+    float pingWidth = 0.0f;                                 // ping-pong width of the echo in this block (0 = centred; audio interrupt)
+    float effectDelta = 0.0f;                               // right minus left of the effect's last sample (audio interrupt)
+    float fxDryScale = 1.0f;                                // 0 in DUB mode: effects and reverb run without their DRY
+    uint8_t dubPage = 0;                                    // 0: the first DUB page, 1: the second (pan, FX send, echo width)
+    uint8_t dubStripSel = 0;                                // the strip the DUB page edits (a pad press selects it)
+    uint32_t dubStripDrawn[kDubStrips] = {0};               // the desk: what each strip shows (a fingerprint), 0 = nothing
+    uint32_t dubReturnDrawn[2] = {0, 0};
+    uint16_t dubMeterDrawn[kDubStrips];                     // the desk's meter heights as drawn (0xFFFF = nothing)
+    uint32_t dubViewStateDrawn = 0;
+    uint32_t dubViewState() const;
+    void lcd_drawDubViewData();
+    void lcd_drawDubMeters();
+    void lcd_drawDeskKnob(uint16_t cx_, uint16_t cy_, uint8_t percent_, RGB16Color color_);
+    void lcd_drawDeskColumn(uint8_t column_);
+    void lcd_drawDeskSegments(uint8_t column_, uint8_t lit_, bool audible_);
+    uint32_t noteViewKey = 0;               // the step edit screen: which layer, bank and layout it was drawn for
+    int16_t noteViewDrawnLast = -1;         // lastActiveBeatNum when it was drawn
+    uint32_t noteViewStateDrawn = 0;
+    uint32_t noteViewState() const;
+    void lcd_drawNoteViewData();
+    void lcd_drawNoteViewBeat(uint8_t beatNum_, bool selected_);
+    void layerInst_setPan(uint8_t layerNum_, uint8_t pan_);
+    bool layerPanActive(uint8_t layerNum_) const;
+    void lcd_drawLayerInst_PanData(uint8_t layerNum_);
+    void dub_select();
+    void dub_step(EncoderFunc function_, bool up_);
+    void lcd_drawDubMenu();
+    void lcd_drawDub_Data();
+    uint32_t file_dubCrc(uint32_t crc_);
+    void layerInst_setSolo(uint8_t layerNum_, bool solo_);
+    void layerInst_clearSolo();
+    void lcd_drawLayerInst_StyleData(uint8_t layerNum_);
+    // Undo / redo of beat and bank edits (UndoLog.h); the stored banks live in SDRAM.
+    UndoLog<kUndoEntries> undoLog;
+    bool undoRecordOpen = false;
+    bool textUndoFlag = false, textRedoFlag = false, textUndoNone = false;
+    bool textFkeyFlag = false;  // F key held: show FKEY
+    void undo_capture(UndoKind kind_, int16_t layerNum_, uint8_t bankNum_);
+    void undo_captureAllLayers(UndoKind kind_, uint8_t bankNum_);
+    void undo_captureRecord(uint8_t layerNum_, uint8_t bankNum_);
+    void undo_apply(bool redo_);
+    void note_select();
+    bool note_validSelection();
+    uint8_t note_effectiveVelocity(const Beat& beat_) const;
+    void note_step(EncoderFunc function_, bool up_);
+    void note_clear();
+    void lcd_drawNoteMenu();
+    void lcd_drawNote_Data();
+    void lcd_drawNoteOverview();
+    void autosave_setInterval(uint8_t interval_);
+    void autosave_markClean();
+    void autosave_scanFile(uint8_t slot_, AutosaveFile& file_);
+    bool autosave_write();
+    bool autosave_writeFiles();
+    uint32_t autosaveLastMs = 0;            // how long the last autosave took (Metronome page)
+    bool autosaveLastOk = true;
+    bool textAutosaveErrFlag = false;
+    void lcd_drawStatusNow(const char* text5_, RGB16Color color_);
+    // Crash record (CrashRecord.h): the last crash, shown at start-up.
+    char crashText[32] = "";
+    bool crash_report();
+    void watchdog_start();
+    void watchdog_stage(uint32_t stage_);
+    void autosave_deleteAll();
+    void autosave_update();
+    void autosave_offerRestore();
+    void autosave_restore();
+
+    bool previewOn = true;              // Metronome page, saved in the system preset
+    uint8_t previewLevel = 70;
+
+    // Song mode (SongChain.h). chainPlay advances in the sequencer interrupt at loop ends.
+    SongChain songChain;
+    ChainPlay chainPlay;
+    uint8_t songStepSel = 0;            // step shown/edited on the SONG page
+    bool songKeyUsed = false;           // a pad was pressed while SONG was held (bank pick, not a tap)
+    volatile bool chainActionFlag = false;  // the interrupt moved the chain: redraw the SONG page
+    // Whole-bank copy/paste on the SONG page (long COPY / PASTE): all 10 layers of the active bank.
+    bool bankCopyKeyFlag = false, bankPasteKeyFlag = false;
+    volatile bool bankCopyActionFlag = false, bankPasteActionFlag = false;
+    bool bankCopyActive = false;
+    uint8_t bankCopySource = 0;
+
+    uint8_t loadFormatVersion = 0;   // format version of the kit/song file being loaded (FileFormat.h)
+    uint32_t pitchTurnTick = 0;      // last PITCH encoder step, for fast-turn octave steps
+    uint32_t pitchOctaveTick = 0;    // last octave step
+    uint32_t lfoValuesDrawTick = 0;  // last refresh of LFO-modulated values on the instrument page
+    uint8_t lfoValuesLive = 0;       // instrument fields currently showing a modulated value (bit per LayerShown)
 
     /* Input Engine Status --------------------------------------- */
 
@@ -287,13 +512,13 @@ class Controller {
 
     /* Hardware Peripherals -------------------------------------- */
 
-    Lcd lcd;                                                            // Main graphical display controller
-    Dac dac;                                                            // High-fidelity audio output interface
-    Sd  sd;                                                             // SD card filesystem manager
+    Lcd lcd{LANDSCAPE_1, WHITE, BLACK, FONT_07x09};                     // Main graphical display controller
+    Dac dac{};                                                          // High-fidelity audio output interface
+    Sd  sd{};                                                           // SD card filesystem manager
 
     /* Input Hardware -------------------------------------------- */
 
-    Keyboard keyboard;                                                  // Button matrix handler (Layers, Left, Right keypads)
+    Keyboard keyboard{};                                                // Button matrix handler (Layers, Left, Right keypads)
 
     Encoder encoder[kEncoderSize];                                      // Physical rotary encoder instances
     EncoderFunc encoderGlobalFunction[kEncoderBankSize][kEncoderSize] = {};
@@ -302,17 +527,18 @@ class Controller {
 
     /* Visual Output Hardware ------------------------------------ */
 
-    Led ledEqLeft;                                                      // Left-channel LED VU/EQ meter
-    Led ledEqRight;                                                     // Right-channel LED VU/EQ meter
-    Led ledLayer;                                                       // Multi-color performance pad indicators
+    Led ledEqLeft{};                                                    // Left-channel LED VU/EQ meter
+    Led ledEqRight{};                                                   // Right-channel LED VU/EQ meter
+    Led ledLayer{};                                                     // Multi-color performance pad indicators
 
     /* State Accessors (Getters) --------------------------------- */
 
     Io     getIo()    { return io; }                                    // Get MIDI/Sync state
+    void   midi_countRxError() { io.midi.rxErrors = io.midi.rxErrors + 1; }  // MIDI IN UART error (diagnostics)
     Mixer  getMixer() { return mixer; }                                 // Get Master audio levels
     Menu   getMenu()  { return menu; }                                  // Get currently active UI screen
 
-    TestMode testMode;                                                  // Current hardware diagnostic sub-mode
+    TestMode testMode = TEST_NONE;                                      // Current hardware diagnostic sub-mode
 
     /* Main Functions -------------------------------------------- */
 
@@ -333,6 +559,13 @@ class Controller {
     bool enqueueMidiTx(const uint8_t* data, uint8_t len);
     void serviceMidiTx();
     void receiveMidiCommand();
+    void midi_thru(uint8_t byte_);
+    void midi_receiveClock(uint32_t nowCycles_);
+    void midi_clockEngage(bool fromMidi_);
+    void midi_clockRelease();
+    bool midi_txTransportOn() const;
+    void midi_clockOnPlayStart();
+    void syncOutClockTick();
 
     /* Song Functions -------------------------------------------- */
 
@@ -456,7 +689,7 @@ class Controller {
     SdResult sd_getSpace();
     SdResult sd_checkFileExist(const char* fileAddress);
     SdResult sd_checkFolderExist(const char* folderAddress);
-    SdResult sd_loadImage(char* fileAddress, uint32_t paletteAddress, uint32_t dataAddress, uint16_t paletteSize, uint16_t width, uint16_t height, RGBMode mode);
+    SdResult sd_loadImage(const char* fileAddress, uint32_t paletteAddress, uint32_t dataAddress, uint16_t paletteSize, uint16_t width, uint16_t height, RGBMode mode);
     void sd_getLibraries();
     SdResult sd_getFileLibrary();
     SdResult sd_getDrumkitLibrary();
@@ -501,6 +734,8 @@ class Controller {
     // Sd functions
     void lcd_drawSdDataIntro();
     void lcd_drawSdData();
+    void lcd_drawMonitor();
+    void lcd_drawMonitorBar(uint16_t textY_, uint16_t barY_, uint32_t permille_, uint32_t& drawn_);
     void lcd_clearSdData();
     void lcd_drawSdAlert(SdResult result_);
     void lcd_clearSdAlert();
@@ -631,6 +866,10 @@ class Controller {
     void lcd_drawLayerInst_SampleData(uint8_t layerNum_);
     void lcd_drawLayerInst_GraphData(uint8_t layerNum_);
     void lcd_drawLayerInst_LevelData(uint8_t layerNum_);
+    bool sd_formatSupported(const char* fileName_, uint16_t refSize_);
+    void layerInst_stepPitch(bool up_, bool encoder_);
+    bool layerInst_lfoShown(uint8_t layerNum_, LayerShown value_, int16_t& shown_);
+    void lcd_drawLayerInstLfoValues();
     void lcd_drawLayerInst_PitchData(uint8_t layerNum_);
     void lcd_drawLayerInst_DirectionData(uint8_t layerNum_);
     void lcd_drawLayerInst_ResolutionData(uint8_t layerNum_);
@@ -638,10 +877,7 @@ class Controller {
     void lcd_drawLayerInst_EndData(uint8_t layerNum_);
     void lcd_drawLayerInst_TimingData(uint8_t layerNum_);
     void lcd_drawLayerInst_ProbabilityData(uint8_t layerNum_);
-    void lcd_drawLayerInst_EqData(uint8_t layerNum_);
-    void lcd_drawLayerInst_FilterData(uint8_t layerNum_);
-    void lcd_drawLayerInst_EffectData(uint8_t layerNum_);
-    void lcd_drawLayerInst_ReverbData(uint8_t layerNum_);
+    void lcd_drawLayerInst_OutData(uint8_t layerNum_);
     // Layer song menu functions
     void lcd_drawLayerSongMenu(uint8_t layerNum_);
     void lcd_drawLayerSong_BeatFillTypeData(uint8_t layerNum_);
@@ -649,6 +885,8 @@ class Controller {
     void lcd_drawLayerSong_BeatFillTimeData(uint8_t layerNum_);
     void lcd_drawLayerSong_BeatFillLevelData(uint8_t layerNum_);
     void lcd_drawLayerSong_BeatFillGraphData(uint8_t layerNum_);
+    void lcd_drawLayerSong_PositionData(uint8_t layerNum_);
+    void lcd_drawLayerSong_ShiftData(uint8_t layerNum_);
     // Layer tab functions
     void lcd_drawLayerTab(uint8_t layerNum_);
     void lcd_drawLayerBox(uint8_t layerNum_);
@@ -968,6 +1206,46 @@ class Controller {
     void layerInst_setReverb(uint8_t layerNum_, uint8_t reverb_);
 
     void layerInst_calculateMixMode(uint8_t layerNum_);
+    void layerInst_setOut(uint8_t layerNum_, uint8_t out_);
+
+    void routing_select();
+    void euclid_select();
+    void song_select();
+    void song_step(EncoderFunc function_, bool up_);
+    void song_setActive(bool active_);
+    void song_manualBank(uint8_t bank_);
+    void song_toStartBank();
+    void song_copyBank();
+    void song_pasteBank();
+    void lcd_drawSongMenu();
+    void lcd_drawSong_Data();
+    void lcd_drawSongOverview();
+    void preview_request(uint8_t layerNum_, bool now_);
+    void preview_start(uint8_t layerNum_);
+    void preview_service();
+    void preview_update();
+    bool preview_padReplay(uint8_t layerNum_);
+    void preview_setOn(bool on_);
+    void preview_setLevel(uint8_t level_);
+    void lcd_drawMetro_PreviewData();
+    void lcd_drawMetro_PreviewLevelData();
+    void lcd_drawMetro_AutosaveData();
+    bool layerPageMenu() const;
+    void euclid_apply();
+    void euclid_clear();
+    void euclid_step(EncoderFunc function_, bool up_);
+    void lcd_drawEuclidMenu();
+    void lcd_drawEuclid_Data();
+    void lcd_drawEuclidOverview();
+    void lcd_drawRoutingMenu();
+    void lcd_drawRouting_Data(uint8_t route_);
+    void lcd_drawRoutingState();
+    void lcd_drawRoutingOverview();
+    void routing_stepModuleOut(uint8_t module_, bool up_);
+    void routing_setModuleOut(uint8_t module_, uint8_t out_);
+    void routing_setMetroOut(uint8_t out_);
+    void routing_setPatch(const uint8_t* kit_);
+    void routing_reset();
 
     void layerInst_setMute(uint8_t layerNum_, bool mute_);
     void layerInst_setFill(uint8_t layerNum_, bool fill_);
@@ -989,17 +1267,20 @@ class Controller {
     void layerSong_beatRight();
     void layerSong_beatLeft();
 
-    void layerSong_setBeat(uint8_t layerNum_, uint8_t bankNum_, uint16_t interval_, uint8_t fillType_, uint8_t fillPattern_, uint8_t fillTime_, uint8_t fillLevel_, bool selected_);
+    void layerSong_setBeat(uint8_t layerNum_, uint8_t bankNum_, uint16_t interval_, uint8_t fillType_, uint8_t fillPattern_, uint8_t fillTime_, uint8_t fillLevel_, bool selected_, uint8_t velocity_ = 0);
     void layerSong_setSelectedBeatFill(uint8_t fillType_, uint8_t fillPattern_, uint8_t fillTime_, uint8_t fillLevel_);
     void layerSong_setSelectedBeatFillTime(uint8_t fillTime_);
     void layerSong_setSelectedBeatFillLevel(uint8_t fillLevel_);
     void layerSong_generateBeat(uint8_t type);
     void layerSong_shiftSelectedBeat(bool direction_);
+    void layerSong_shiftAll(bool forward_);
+    void layerSong_insertBeat();
+    void layerSong_commitBank(int16_t selectedBeatNum_);
     void layerSong_resetSelectedBeat();
     void layerSong_resetBeats(uint8_t layerNum_, uint8_t bankNum_, uint16_t startInterval_);
     void layerSong_resetAllBeats(uint8_t layerNum_, uint8_t bankNum_);
     void layerSong_quantizeActiveBeats(uint8_t layerNum_, uint8_t bankNum_);
-    void layerSong_arrangeActiveBeats(uint8_t layerNum_, uint8_t bankNum_, bool duplicate_, bool collect_, bool sort_, bool lastFill_);
+    void layerSong_arrangeActiveBeats(uint8_t layerNum_, uint8_t bankNum_);
     void layerSong_calculateLastActiveBeatNum(uint8_t layerNum_, uint8_t bankNum_);
     void layerSong_calculatePlayBeatNum(uint8_t layerNum_, uint8_t bankNum_, uint16_t playInterval_);
     void layerSong_calculateBeatFill(uint8_t layerNum_, uint8_t bankNum_, uint8_t beatNum_, uint8_t fillType_, uint8_t fillPattern, uint8_t fillTime_, uint8_t fillLevel_);
@@ -1029,13 +1310,15 @@ class Controller {
     void processAudioReceive(uint32_t* inputtBuffer);
     void processAudioMetronome();
     void processAudioLayer();
+    void processAudioRouting();
     void processAudioEq();
-    void processAudioFilter();
-    void processAudioEffect();
+    void processAudioFilter(uint8_t filterNum_);
+    void processAudioEffect(uint8_t effectNum_);
     void processAudioReverb();
     void processAudioSend(uint32_t* outputBuffer);
 
-    float processAudioFilterHelper(uint8_t filterNum_, float audio_);
+    float processAudioFilterHelper(uint8_t filterNum_, uint8_t channel_, float audio_);
+    float effectDryGain(uint8_t effectNum_) const;
     float processAudioEffectHelper(uint8_t effectNum_, float audio_);
     float processAudioLpfHelper(uint8_t lpfNum_, float audio_);
 

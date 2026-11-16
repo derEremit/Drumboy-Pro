@@ -1,0 +1,57 @@
+name: Release
+
+# Push a tag named after the version in Core/Library/Global/Version.h, e.g.
+#   git tag v1.04 && git push origin v1.04
+# or create a release with a new tag v1.04 on github.com (Releases > Draft a new release),
+# to build, test and publish Drumboy_Pro_Fw_01_04.bin on that GitHub Release.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+
+      - name: Check tag matches Version.h
+        working-directory: "02 Software/Drumboy-Pro-App-H723"
+        run: |
+          want="v$(make -s version)"
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Version.h ($want). Update Version.h or retag."
+            exit 1
+          fi
+
+      - name: Fill engine tests
+        run: make -C "02 Software/tests"
+
+      - name: Build and package
+        working-directory: "02 Software/Drumboy-Pro-App-H723"
+        run: |
+          make -j"$(nproc)" WERROR=1
+          make package
+
+      - name: Publish release
+        working-directory: "02 Software/Drumboy-Pro-App-H723"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pkg=$(ls build/Drumboy_Pro_Fw_*.bin)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Release already made on github.com (that also creates the tag): attach the build to it
+            gh release upload "$GITHUB_REF_NAME" "$pkg" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$pkg" \
+              --title "Drumboy Pro firmware $GITHUB_REF_NAME" \
+              --generate-notes \
+              --notes "Copy $(basename "$pkg") to the top level of the SD card (with no other Drumboy_Pro_Fw_*.bin files) and power on. The bootloader shows the version while it updates."
+          fi
