@@ -225,6 +225,13 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
   if (!((uint32_t)buff & SD_DMA_ALIGN_MASK))
   {
 #endif
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+    /*
+    a dirty line of the destination could be written back while the DMA fills it and overwrite the new
+    data: flush and drop the lines first (the invalidate after the transfer then takes what the DMA wrote)
+    */
+    SCB_CleanInvalidateDCache_by_Addr((uint32_t*)((uint32_t)buff & ~0x1F), count*BLOCKSIZE + ((uint32_t)buff - ((uint32_t)buff & ~0x1F)));
+#endif
     if(BSP_SD_ReadBlocks_DMA((uint32_t*)buff,
                              (uint32_t) (sector),
                              count) == MSD_OK)

@@ -35,7 +35,12 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     Drivers/CMSIS/Device/ST/STM32H7xx/Include Drivers/CMSIS/Include
     Core/Library/Global Core/Library/Lcd Core/Library/Dac Core/Library/Controller)
 
-target_compile_definitions(${PROJECT_NAME} PRIVATE DEBUG USE_PWR_LDO_SUPPLY USE_HAL_DRIVER STM32H723xx)
+# Data cache: off here, as on every build this fork has run on hardware. The Makefile (Miguel's
+# build) defaults to DCACHE=1 since V1.15; -DDRUMBOY_DCACHE=ON gives the same. With the cache on,
+# every DMA from or into cacheable memory needs cache maintenance (see FATFS/Target/sd_diskio.c).
+option(DRUMBOY_DCACHE "Enable the data cache (ENABLE_DCACHE)" OFF)
+target_compile_definitions(${PROJECT_NAME} PRIVATE DEBUG USE_PWR_LDO_SUPPLY USE_HAL_DRIVER STM32H723xx
+    $<$<BOOL:${DRUMBOY_DCACHE}>:ENABLE_DCACHE>)
 
 target_compile_options(${PROJECT_NAME} PRIVATE
     ${MCU_FLAGS}

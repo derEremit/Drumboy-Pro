@@ -402,7 +402,7 @@ void Error_Handler(void) {
     __disable_irq();
     // Record who called it and restart (CrashRecord.h); a repeat during start-up stays here.
     uint32_t frame[8] = {0};
-    frame[6] = reinterpret_cast<uint32_t>(__builtin_return_address(0));
+    frame[6] = (uint32_t)reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     Crash_Capture(frame, CRASH_ERROR_HANDLER);
     while (1) {
     }

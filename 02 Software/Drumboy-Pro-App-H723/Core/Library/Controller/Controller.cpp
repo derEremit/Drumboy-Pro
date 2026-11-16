@@ -26199,7 +26199,7 @@ void Controller::processAudioLayer() {
             float localCache[I2S_BLOCK_SIZE];
             float localCacheR[I2S_BLOCK_SIZE];
             if (copySize > 0) memcpy(localCache, sourceAddress, copySize * sizeof(float));
-            if (stereo && (copySize > 0)) memcpy(localCacheR, (const float*)((uint32_t)sourceAddress + aBD.stereoOffset), copySize * sizeof(float));
+            if (stereo && (copySize > 0)) memcpy(localCacheR, (const float*)((uintptr_t)sourceAddress + aBD.stereoOffset), copySize * sizeof(float));
 
             if (aBD.counter == aBD.counterStart) io.midi.txTriggerNoteOn[i] = true;
 
