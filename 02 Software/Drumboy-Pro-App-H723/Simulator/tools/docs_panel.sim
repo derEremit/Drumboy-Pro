@@ -1,0 +1,26 @@
+# The simulator window for docs/images/simulator_panel.png: drumkit 2 and a generated pattern, playing.
+# Run by docs_screenshots.sh (needs the window, so not headless).
+
+wait-ready 30000
+wait-stable 500
+press DRUMKIT
+wait-menu DRUMKIT 2000
+press RIGHT
+press UP
+press ADD
+wait-stable 300
+press ADD
+wait 1000
+wait-stable 500 20000
+press FILL+STYLE
+wait 300
+press PASTE
+wait-stable 300
+press FILL+STYLE
+wait 300
+press RHYTHM
+press PLAYSTOP
+wait 1500
+window-screenshot simulator_panel.png
+press PLAYSTOP
+quit

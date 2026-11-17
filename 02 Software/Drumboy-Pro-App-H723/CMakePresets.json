@@ -1,0 +1,38 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "Simulator",
+            "displayName": "Simulator (macOS desktop build, x86_64 via Rosetta)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "toolchainFile": "${sourceDir}/Simulator/cmake/host.cmake",
+            "cacheVariables": {
+                "DRUMBOY_SIMULATOR": "ON",
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_OSX_ARCHITECTURES": "x86_64",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++"
+            },
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+        },
+        {
+            "name": "SimulatorLinux",
+            "displayName": "Simulator (Linux desktop build, x86_64, system SDL3 + poppler)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "toolchainFile": "${sourceDir}/Simulator/cmake/host.cmake",
+            "cacheVariables": {
+                "DRUMBOY_SIMULATOR": "ON",
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++"
+            },
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+        }
+    ],
+    "buildPresets": [
+        { "name": "Simulator", "configurePreset": "Simulator" },
+        { "name": "SimulatorLinux", "configurePreset": "SimulatorLinux" }
+    ]
+}

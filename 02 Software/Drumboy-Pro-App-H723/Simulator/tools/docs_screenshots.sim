@@ -1,0 +1,83 @@
+# Screenshots for docs/images: drumkit 2, a generated pattern and every page the docs show.
+# Run by docs_screenshots.sh, which first switches the CPU meter and the visualizer on.
+
+wait-ready 30000
+wait-stable 500
+
+# Drumkit 2
+press DRUMKIT
+wait-menu DRUMKIT 2000
+press RIGHT
+press UP
+press ADD
+wait-stable 300
+press ADD
+wait 1000
+wait-stable 500 20000
+
+# Generator: GEN, new seed, then the other pages while playing
+press FILL+STYLE
+wait 300
+turn 3 6
+press PASTE
+wait-stable 300
+press PLAYSTOP
+wait 1500
+screenshot generator_gen.png
+press STYLE
+wait 200
+turn 0 4
+wait 1200
+screenshot generator_grids.png
+press STYLE
+wait 200
+press 4
+turn 1 3
+wait 1200
+screenshot generator_euclid.png
+press STYLE
+wait 200
+press 2
+press RIGHT
+press RIGHT
+turn 0 2
+wait 1200
+screenshot generator_step.png
+press FILL+STYLE
+wait 1000
+
+# Main screen while playing (CPU meter top left), File menu label
+press RHYTHM
+wait 1500
+screenshot home_playing.png
+press FILE
+wait-menu FILE 2000
+wait 500
+screenshot file_menu.png
+
+# Manager (both pages), then show mode: psychedelic -> SELECT
+press FILE
+wait 500
+expect manager == 1
+screenshot manager_plugins.png
+press RIGHT
+wait 500
+screenshot manager_firmware.png
+press LEFT
+wait 300
+press DOWN
+press DOWN
+press ADD
+wait 4000
+screenshot visual_1.png
+turn 0 2
+wait 4000
+screenshot visual_2.png
+turn 0 1
+wait 4000
+screenshot visual_3.png
+press FILE
+wait 800
+press PLAYSTOP
+warnings
+quit

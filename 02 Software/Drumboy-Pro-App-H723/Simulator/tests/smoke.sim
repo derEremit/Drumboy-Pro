@@ -1,0 +1,32 @@
+# Boot, main page, Rhythm page, transport and audio (metronome during record).
+# Run with Simulator/tools/run_tests.sh; relative paths go to the output folder.
+
+wait-ready 30000
+wait-stable 500
+expect menu == GLOBAL
+expect lcd.on == 1
+screenshot boot.png
+
+press RHYTHM
+wait-menu RHYTHM 2000
+expect tempo == 120
+turn 0 3
+wait 200
+expect tempo > 120
+turn 0 -3
+wait 200
+wait-stable 300
+screenshot rhythm.png
+
+press PLAY
+wait 500
+expect play == 1
+press PLAY
+press REC
+wait 1500
+expect record == 1
+level 1000
+expect audio.peak > -40
+record metronome.wav 2000
+press PLAY
+warnings

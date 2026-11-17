@@ -1,0 +1,101 @@
+# Stock-UI recipe: a 4-bar two-step drum-and-bass pattern, no live recording.
+# Kick on steps 1 and 11, snare on 5 and 13, hats in sixteenths, 173 BPM.
+# Run: DrumboySim --headless --card <clone> --script this_file --out <dir>
+# or feed the lines to simctl. Defaults assumed: 4/4, 4 bars, quantize 1/16.
+# Holding SELECT in an empty track advances one generation stage per second:
+#   stage 0 = one hit per bar, 1 = plus half-bar hits, 2 = plus quarter hits,
+#   3 = BASIC_4 fill on every hit, 4 = BASIC_8.
+# SELECT held + LEFT/RIGHT nudges the selected hit by one quantize step.
+# A short CLEAR deletes the selected hit; a long CLEAR empties the track.
+
+wait-ready 30000
+wait-stable 500
+
+# Drumkit slot 2 so the recording has sound
+press DRUMKIT
+wait-menu DRUMKIT 2000
+press RIGHT
+press UP
+press ADD
+wait-stable 300
+press ADD
+wait 1000
+wait-stable 500 20000
+
+# Kick: bar hits plus half-bar hits, nudge each half-bar hit two sixteenths right
+press LAYER_SONG+0
+wait-stable 300
+press ADD 2300
+wait-stable 300
+press RIGHT
+press ADD+RIGHT
+press ADD+RIGHT
+press RIGHT
+press RIGHT
+press ADD+RIGHT
+press ADD+RIGHT
+press RIGHT
+press RIGHT
+press ADD+RIGHT
+press ADD+RIGHT
+press RIGHT
+press RIGHT
+press ADD+RIGHT
+press ADD+RIGHT
+wait-stable 200
+dump-track 1
+
+# Snare: quarter hits, then delete every other one starting with the first.
+# Deleting hit 0 moves the selection to the last hit; RIGHT wraps to the front.
+press LAYER_SONG+1
+wait-stable 300
+press ADD 3300
+wait-stable 300
+press CLEAR 100
+press RIGHT
+press RIGHT
+press CLEAR 100
+press RIGHT
+press RIGHT
+press CLEAR 100
+press RIGHT
+press RIGHT
+press CLEAR 100
+press RIGHT
+press RIGHT
+press CLEAR 100
+press RIGHT
+press RIGHT
+press CLEAR 100
+press RIGHT
+press RIGHT
+press CLEAR 100
+press RIGHT
+press RIGHT
+press CLEAR 100
+wait-stable 200
+dump-track 2
+
+# Hats: quarter hits with BASIC_4 on each = sixteenths
+press LAYER_SONG+2
+wait-stable 300
+press ADD 5400
+wait-stable 300
+dump-track 3
+
+# Tempo
+press RHYTHM
+wait-stable 300
+turn 0 54
+wait-stable 200
+expect tempo >= 170
+press CENTER
+wait-stable 300
+
+expect song.beats == 8,8,16,0,0,0,0,0,0,0
+screenshot dnb_two_step.png
+press PLAY
+wait 800
+record dnb_two_step.wav 3000
+expect audio.peak > -30
+press PLAY

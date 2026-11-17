@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Send commands to a running Drumboy simulator (DrumboySim --control SOCKET).
+
+    simctl [--socket PATH] COMMAND...        one command per argument
+    simctl [--socket PATH] -                 commands from stdin, one per line
+
+Each reply is printed on its own line. Exit status is 1 if any reply starts
+with "error", 2 if the simulator cannot be reached. Run `simctl help` for the
+command list.
+"""
+
+import os
+import socket
+import sys
+import time
+
+DEFAULT_SOCKET = os.environ.get("DRUMBOY_SIM_SOCKET", "/tmp/drumboy-sim.sock")
+
+
+def main(argv):
+    path = DEFAULT_SOCKET
+    if len(argv) >= 2 and argv[0] == "--socket":
+        path, argv = argv[1], argv[2:]
+    if not argv:
+        print(__doc__.strip())
+        return 2
+    commands = [line.strip() for line in sys.stdin] if argv == ["-"] else argv
+    commands = [c for c in commands if c and not c.startswith("#")]
+
+    # The simulator may still be starting: retry the connection for a few seconds
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    for attempt in range(50):
+        try:
+            sock.connect(path)
+            break
+        except OSError:
+            if attempt == 49:
+                print(f"error cannot connect to {path}", file=sys.stderr)
+                return 2
+            time.sleep(0.1)
+
+    failed = False
+    reader = sock.makefile("r")
+    for command in commands:
+        try:
+            sock.sendall((command + "\n").encode())
+            reply = reader.readline().rstrip("\n")
+        except OSError:
+            reply = ""                                      # Connection closed (the simulator quit or restarted)
+        if not reply and command.split()[0] not in ("quit", "restart"):
+            print("error connection closed")
+            return 1
+        if not reply and command.split()[0] in ("quit", "restart"):
+            reply = "ok"                                    # The simulator exits / re-execs without replying
+        print(reply)
+        failed |= reply.startswith("error")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

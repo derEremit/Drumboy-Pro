@@ -1,0 +1,8 @@
+// Simulator wrapper around <cstdio>: libstdc++ undefines the sprintf macro
+// from sim_prelude.h in here, which would route the firmware's sprintf calls
+// past the overflow guard. Include the real header, then put the guard back.
+#ifndef __SIM_CSTDIO
+#define __SIM_CSTDIO
+#include_next <cstdio>
+#include "sim_sprintf.h"
+#endif

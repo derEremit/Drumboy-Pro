@@ -7,17 +7,38 @@
 # build/ is gitignored. Outputs: the raw application image for 0x08020000 and,
 # through ../Firmware/make_sd_package.py, the SD-card package with the 36-byte
 # header the bootloader checks (title, version, size, CRC).
+#
+# Desktop simulator instead of the firmware (Simulator/README.md), x86_64 Linux or macOS:
+#   cmake --preset SimulatorLinux && cmake --build --preset SimulatorLinux    (macOS: Simulator)
+#   -> build/SimulatorLinux/Simulator/DrumboySim
 cmake_minimum_required(VERSION 3.22)
-if(NOT CMAKE_TOOLCHAIN_FILE)
+option(DRUMBOY_SIMULATOR "Build the desktop simulator (Simulator/) instead of the firmware" OFF)
+if(NOT CMAKE_TOOLCHAIN_FILE AND NOT DRUMBOY_SIMULATOR)
     set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/cmake/arm-none-eabi.cmake")
 endif()
-project(Drumboy-Pro-App-H723 C CXX ASM)
+if(DRUMBOY_SIMULATOR)
+    project(Drumboy-Pro-App-H723 C CXX)
+else()
+    project(Drumboy-Pro-App-H723 C CXX ASM)
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(DRUMBOY_SIMULATOR)
+    # No plugin host in this tree (the simulator comes from cyberyak/Drumboy-Pro, which has one)
+    set(DRUMBOY_PLUGINS OFF)
+    set(DRUMBOY_BRANDING OFF)
+    set(FW_BUILD_NUMBER 0)
+    if(NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE Debug)
+    endif()
+    add_subdirectory(Simulator)
+    return()
+endif()
 
 set(MCU_FLAGS -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb)
 

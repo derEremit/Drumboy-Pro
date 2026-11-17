@@ -1,0 +1,41 @@
+# Load drumkit slot 2 from the card, play the pads, record a pattern live.
+
+wait-ready 30000
+wait-stable 500
+
+# DRUMKIT page, Load tab (RIGHT), slot 2 (UP), SELECT asks, SELECT confirms
+press DRUMKIT
+wait-menu DRUMKIT 2000
+press RIGHT
+press UP
+press ADD
+wait-stable 300
+expect alert == 1
+press ADD
+wait 1000
+wait-stable 500 20000
+screenshot kit_loaded.png
+
+# Pads make sound
+press 0
+level 200
+expect audio.peak > -40
+
+# GLOBAL page, REC (with precount), tap a pattern
+press CENTER
+wait-menu GLOBAL 2000
+press REC
+wait 2000
+press 0 40
+wait 200
+press 2 40
+wait 200
+press 1 40
+wait 200
+press 2 40
+wait 1500
+expect record == 1
+wait 100
+screenshot pattern.png
+record pattern.wav 2000
+state
